@@ -178,6 +178,7 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
     let mut observed: Vec<OperationReport> = Vec::new();
     let mut timed_out = false;
     let mut execution_incomplete = false;
+    let mut recovery_verification_needed = false;
     let mut recovery_verified = false;
     let mut verification_incomplete = false;
     let mut faults = plan.scenario.faults.clone();
@@ -266,6 +267,7 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
         observed.append(&mut segment_reports);
 
         if matches!(status, WorkerStatus::Crashed | WorkerStatus::Interrupted) {
+            recovery_verification_needed = true;
             if let Some(fault) = &next_fault {
                 notes.push(format!(
                     "simulated {:?} at step {}",
@@ -274,6 +276,7 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
                 if let Err(error) = apply_fault(&db_path, fault) {
                     notes.push(format!("fault {:?} was not applied: {error}", fault.class));
                     execution_incomplete = true;
+                    recovery_verification_needed = true;
                     break;
                 }
                 start = if matches!(fault.class, FaultClass::AckBeforeReportCrash) {
@@ -287,17 +290,20 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
             }
             notes.push("worker crashed without an expected fault trigger".to_string());
             execution_incomplete = true;
+            recovery_verification_needed = true;
             break;
         }
 
         if status == WorkerStatus::Failed {
             notes.push("worker process failed".to_string());
             execution_incomplete = true;
+            recovery_verification_needed = true;
             break;
         }
 
         if status == WorkerStatus::TimedOut {
             timed_out = true;
+            recovery_verification_needed = true;
             notes.push(format!(
                 "scenario exceeded max runtime of {} ms",
                 effective_max_runtime_ms
@@ -313,7 +319,7 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
         }
     }
 
-    if timed_out {
+    if recovery_verification_needed {
         let verifier_commands = segment_dir.join("recovery-verifier-commands.json");
         let verifier_report = segment_dir.join("recovery-verifier-report.jsonl");
         let verifier_lifecycle = segment_dir.join("recovery-verifier-lifecycle.json");
@@ -341,18 +347,18 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
         match verifier_status {
             WorkerStatus::Ok => {
                 recovery_verified = true;
-                notes.push("post-timeout recovery verification completed".to_string());
+                notes.push("post-fault recovery verification completed".to_string());
             }
             WorkerStatus::TimedOut => {
                 verification_incomplete = true;
                 notes.push(format!(
-                    "post-timeout recovery verification exceeded {} ms",
+                    "post-fault recovery verification exceeded {} ms",
                     cfg.config.recovery_timeout_ms
                 ));
             }
             WorkerStatus::Failed | WorkerStatus::Crashed | WorkerStatus::Interrupted => {
                 verification_incomplete = true;
-                notes.push("post-timeout recovery verifier failed before completing".to_string());
+                notes.push("post-fault recovery verifier failed before completing".to_string());
             }
         }
     }
