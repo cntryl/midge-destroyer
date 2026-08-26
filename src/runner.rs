@@ -327,21 +327,37 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
             .context("write recovery verifier command file")?;
         let recovery_deadline =
             std::time::Instant::now() + Duration::from_millis(cfg.config.recovery_timeout_ms);
-        let verifier_status = run_worker(
-            &metadata,
-            None,
-            None,
-            None,
-            &db_path,
-            &verifier_commands,
-            &verifier_report,
-            &command_path,
-            &verifier_lifecycle,
-            recovery_deadline,
-        )
-        .context("run post-timeout recovery verifier")?;
-        let mut verifier_reports = read_report_lines(&verifier_report)
-            .context("read post-timeout recovery verifier report")?;
+        let (verifier_status, mut verifier_reports) = loop {
+            let _ = std::fs::remove_file(&verifier_report);
+            let status = run_worker(
+                &metadata,
+                None,
+                None,
+                None,
+                &db_path,
+                &verifier_commands,
+                &verifier_report,
+                &command_path,
+                &verifier_lifecycle,
+                recovery_deadline,
+            )
+            .context("run post-fault recovery verifier")?;
+            let reports = read_report_lines(&verifier_report)
+                .context("read post-fault recovery verifier report")?;
+            if reports.iter().any(is_lease_held_report)
+                && std::time::Instant::now() < recovery_deadline
+            {
+                notes.push(
+                    "recovery verifier fenced by live lease; retrying until safe takeover"
+                        .to_string(),
+                );
+                let remaining =
+                    recovery_deadline.saturating_duration_since(std::time::Instant::now());
+                std::thread::sleep(std::cmp::min(Duration::from_secs(1), remaining));
+                continue;
+            }
+            break (status, reports);
+        };
         verifier_reports.retain(|report| report.phase != ReportPhase::Lifecycle);
         observed.append(&mut verifier_reports);
         match verifier_status {
