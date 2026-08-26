@@ -8,10 +8,9 @@ services:
       SQRZL_SECRET_ACCESS_KEY: easy-peasy
       SQRZL_BUCKET_LIST: midge-destroyer
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1::9000"
+      - "127.0.0.1::9001"
     volumes:
-      - midge-gcs-data:/app/blobs
-
-volumes:
-  midge-gcs-data:
+      - type: bind
+        source: ${SQRZL_BLOBS_HOST_PATH:?set SQRZL_BLOBS_HOST_PATH}
+        target: /app/blobs

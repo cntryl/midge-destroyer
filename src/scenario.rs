@@ -1,5 +1,6 @@
-use crate::config::RunScale;
+use crate::config::{RunScale, SuitePreset};
 use crate::ledger::{LedgerEntry, MutationOutcome};
+use crate::types::BackendKind;
 use rand::rngs::SmallRng;
 use rand::{prelude::IndexedRandom, prelude::SliceRandom, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,7 @@ pub enum FaultClass {
 }
 
 impl FaultClass {
+    #[must_use]
     pub fn expected_behavior(&self) -> FaultExpectation {
         match self {
             Self::ProcessKill
@@ -45,37 +47,37 @@ impl FaultClass {
             | Self::FlushCompactionBarrierFault
             | Self::LeaseRenewalCut
             | Self::MigrationBoundaryFault => FaultExpectation::TemporarilyUnavailable,
-            Self::SstCorruption | Self::ExactWalPathFault | Self::ManifestCheckpointCut => {
-                FaultExpectation::SafetyPreserved
-            }
-            Self::ProviderLatencySpike | Self::AckBeforeReportCrash | Self::CloudCacheLoss => {
-                FaultExpectation::SafetyPreserved
-            }
+            Self::SstCorruption
+            | Self::ExactWalPathFault
+            | Self::ManifestCheckpointCut
+            | Self::ProviderLatencySpike
+            | Self::AckBeforeReportCrash
+            | Self::CloudCacheLoss => FaultExpectation::SafetyPreserved,
         }
     }
 
+    #[must_use]
     pub fn all() -> &'static [Self] {
-        use FaultClass::*;
         const FAULTS: &[FaultClass] = &[
-            ProcessKill,
-            ForcedReopen,
-            StaleCacheCleanup,
-            DroppedWrite,
-            WalTruncationRace,
-            ManifestInterruption,
-            SstCorruption,
-            CompactionRace,
-            LeaseStalenessWindow,
-            ProviderLatencySpike,
-            RegionPartition,
-            StrictAsyncDurabilityFlip,
-            ExactWalPathFault,
-            ManifestCheckpointCut,
-            FlushCompactionBarrierFault,
-            LeaseRenewalCut,
-            MigrationBoundaryFault,
-            AckBeforeReportCrash,
-            CloudCacheLoss,
+            FaultClass::ProcessKill,
+            FaultClass::ForcedReopen,
+            FaultClass::StaleCacheCleanup,
+            FaultClass::DroppedWrite,
+            FaultClass::WalTruncationRace,
+            FaultClass::ManifestInterruption,
+            FaultClass::SstCorruption,
+            FaultClass::CompactionRace,
+            FaultClass::LeaseStalenessWindow,
+            FaultClass::ProviderLatencySpike,
+            FaultClass::RegionPartition,
+            FaultClass::StrictAsyncDurabilityFlip,
+            FaultClass::ExactWalPathFault,
+            FaultClass::ManifestCheckpointCut,
+            FaultClass::FlushCompactionBarrierFault,
+            FaultClass::LeaseRenewalCut,
+            FaultClass::MigrationBoundaryFault,
+            FaultClass::AckBeforeReportCrash,
+            FaultClass::CloudCacheLoss,
         ];
         FAULTS
     }
@@ -85,6 +87,180 @@ impl FaultClass {
 pub enum FaultExpectation {
     SafetyPreserved,
     TemporarilyUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendApplicability {
+    Any,
+    LocalOnly,
+    CloudOnly,
+}
+
+impl BackendApplicability {
+    fn includes(self, backend: BackendKind) -> bool {
+        match self {
+            Self::Any => true,
+            Self::LocalOnly => backend == BackendKind::Local,
+            Self::CloudOnly => backend.is_cloud(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ScenarioDefinition {
+    pub name: &'static str,
+    pub applicability: BackendApplicability,
+    pub required_feature: Option<&'static str>,
+    pub expected_behavior: FaultExpectation,
+    pub smoke: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScenarioAvailability {
+    Runnable,
+    Skipped { reason: &'static str },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ScenarioSelection {
+    pub definition: &'static ScenarioDefinition,
+    pub availability: ScenarioAvailability,
+}
+
+const SCENARIO_CATALOG: &[ScenarioDefinition] = &[
+    ScenarioDefinition {
+        name: "smoke-local",
+        applicability: BackendApplicability::LocalOnly,
+        required_feature: None,
+        expected_behavior: FaultExpectation::SafetyPreserved,
+        smoke: true,
+    },
+    ScenarioDefinition {
+        name: "sqrzl-visibility",
+        applicability: BackendApplicability::CloudOnly,
+        required_feature: None,
+        expected_behavior: FaultExpectation::TemporarilyUnavailable,
+        smoke: true,
+    },
+    ScenarioDefinition {
+        name: "recovery-crash-loop",
+        applicability: BackendApplicability::Any,
+        required_feature: None,
+        expected_behavior: FaultExpectation::TemporarilyUnavailable,
+        smoke: false,
+    },
+    ScenarioDefinition {
+        name: "lease-takeover-latency",
+        applicability: BackendApplicability::Any,
+        required_feature: None,
+        expected_behavior: FaultExpectation::TemporarilyUnavailable,
+        smoke: false,
+    },
+    ScenarioDefinition {
+        name: "ack-kill-window",
+        applicability: BackendApplicability::Any,
+        required_feature: None,
+        expected_behavior: FaultExpectation::SafetyPreserved,
+        smoke: false,
+    },
+    ScenarioDefinition {
+        name: "cloud-cache-loss",
+        applicability: BackendApplicability::CloudOnly,
+        required_feature: None,
+        expected_behavior: FaultExpectation::SafetyPreserved,
+        smoke: false,
+    },
+    ScenarioDefinition {
+        name: "manifest-race",
+        applicability: BackendApplicability::Any,
+        required_feature: None,
+        expected_behavior: FaultExpectation::TemporarilyUnavailable,
+        smoke: false,
+    },
+    ScenarioDefinition {
+        name: "sst-corruption",
+        applicability: BackendApplicability::Any,
+        required_feature: None,
+        expected_behavior: FaultExpectation::SafetyPreserved,
+        smoke: false,
+    },
+    ScenarioDefinition {
+        name: "wal-sync-ack-cut",
+        applicability: BackendApplicability::Any,
+        required_feature: Some("failpoint-tier"),
+        expected_behavior: FaultExpectation::SafetyPreserved,
+        smoke: false,
+    },
+    ScenarioDefinition {
+        name: "manifest-sync-failure",
+        applicability: BackendApplicability::Any,
+        required_feature: Some("failpoint-tier"),
+        expected_behavior: FaultExpectation::SafetyPreserved,
+        smoke: false,
+    },
+    ScenarioDefinition {
+        name: "compaction-commit-cut",
+        applicability: BackendApplicability::Any,
+        required_feature: Some("failpoint-tier"),
+        expected_behavior: FaultExpectation::TemporarilyUnavailable,
+        smoke: false,
+    },
+    ScenarioDefinition {
+        name: "wal-prune-cut",
+        applicability: BackendApplicability::CloudOnly,
+        required_feature: Some("failpoint-tier"),
+        expected_behavior: FaultExpectation::TemporarilyUnavailable,
+        smoke: false,
+    },
+    ScenarioDefinition {
+        name: "lease-renewal-failure",
+        applicability: BackendApplicability::Any,
+        required_feature: Some("failpoint-tier"),
+        expected_behavior: FaultExpectation::TemporarilyUnavailable,
+        smoke: false,
+    },
+    ScenarioDefinition {
+        name: "flush-barrier",
+        applicability: BackendApplicability::Any,
+        required_feature: Some("failpoint-tier"),
+        expected_behavior: FaultExpectation::TemporarilyUnavailable,
+        smoke: false,
+    },
+];
+
+#[must_use]
+pub fn scenario_definition(name: &str) -> Option<&'static ScenarioDefinition> {
+    SCENARIO_CATALOG
+        .iter()
+        .find(|definition| definition.name == name)
+}
+
+#[must_use]
+pub fn suite_scenarios(
+    preset: SuitePreset,
+    backend: BackendKind,
+    failpoints_enabled: bool,
+) -> Vec<ScenarioSelection> {
+    SCENARIO_CATALOG
+        .iter()
+        .filter(|definition| definition.applicability.includes(backend))
+        .filter(|definition| match preset {
+            SuitePreset::Smoke => definition.smoke,
+            SuitePreset::Standard | SuitePreset::Soak => true,
+        })
+        .map(|definition| {
+            let availability = match definition.required_feature {
+                Some(_) if !failpoints_enabled => ScenarioAvailability::Skipped {
+                    reason: "requires failpoint-tier feature",
+                },
+                _ => ScenarioAvailability::Runnable,
+            };
+            ScenarioSelection {
+                definition,
+                availability,
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -128,6 +304,7 @@ pub struct DeterministicPlan {
 }
 
 impl Scenario {
+    #[must_use]
     pub fn new(name: &str, seed: u64, scale: RunScale) -> Self {
         let mut ops = Vec::new();
         for i in 0..scale.ops() {
@@ -161,11 +338,13 @@ impl Scenario {
         }
     }
 
+    #[must_use]
     pub fn with_faults(mut self, faults: Vec<ScenarioFault>) -> Self {
         self.faults = faults;
         self
     }
 
+    #[must_use]
     pub fn append_fault(self, step: usize, class: FaultClass) -> Self {
         let mut faults = self.faults;
         faults.push(ScenarioFault {
@@ -181,22 +360,12 @@ impl Scenario {
 }
 
 impl DeterministicPlan {
+    #[must_use]
     pub fn from_seed(name: &str, seed: u64, scale: RunScale) -> Self {
         let mut rng = SmallRng::seed_from_u64(seed);
         let mut scenario = Scenario::new(name, seed, scale);
 
-        let fault_count = match (name, scale) {
-            ("smoke-local", _) => 0,
-            ("recovery-crash-loop", RunScale::Small) => 1,
-            ("recovery-crash-loop", RunScale::Medium) => 2,
-            ("recovery-crash-loop", RunScale::Large) => 4,
-            ("recovery-crash-loop", RunScale::XLarge) => 8,
-            ("ack-kill-window" | "cloud-cache-loss", RunScale::Small) => 1,
-            ("ack-kill-window" | "cloud-cache-loss", RunScale::Medium) => 2,
-            ("ack-kill-window" | "cloud-cache-loss", RunScale::Large) => 4,
-            ("ack-kill-window" | "cloud-cache-loss", RunScale::XLarge) => 8,
-            _ => (scale.ops() as f64 * 0.15).round() as usize,
-        };
+        let fault_count = scenario_fault_count(name, scale);
         let mut candidates: Vec<usize> = if name == "ack-kill-window" {
             scenario
                 .operations
@@ -214,7 +383,9 @@ impl DeterministicPlan {
         let mut faults = Vec::with_capacity(fault_count.min(candidates.len()));
 
         for step in candidates.iter().take(fault_count.min(candidates.len())) {
-            let class = *fault_catalog(name).choose(&mut rng).expect("fault catalog");
+            let Some(class) = fault_catalog(name).choose(&mut rng).copied() else {
+                continue;
+            };
             faults.push(ScenarioFault {
                 step: *step,
                 class,
@@ -233,6 +404,7 @@ impl DeterministicPlan {
         }
     }
 
+    #[must_use]
     pub fn to_expected_ledger(&self) -> Vec<LedgerEntry> {
         self.scenario
             .operations
@@ -248,23 +420,54 @@ impl DeterministicPlan {
     }
 }
 
+fn scenario_fault_count(name: &str, scale: RunScale) -> usize {
+    if name == "smoke-local" {
+        0
+    } else if matches!(
+        name,
+        "recovery-crash-loop" | "lease-takeover-latency" | "ack-kill-window" | "cloud-cache-loss"
+    ) || scenario_definition(name)
+        .is_some_and(|definition| definition.required_feature.is_some())
+    {
+        scale.concurrency()
+    } else {
+        default_fault_count(scale)
+    }
+}
+
+fn default_fault_count(scale: RunScale) -> usize {
+    scale.ops().saturating_mul(15).saturating_add(50) / 100
+}
+
 fn fault_catalog(name: &str) -> &'static [FaultClass] {
-    use FaultClass::*;
     match name {
-        "recovery-crash-loop" => &[ProcessKill, ForcedReopen],
-        "ack-kill-window" => &[AckBeforeReportCrash],
-        "cloud-cache-loss" => &[CloudCacheLoss],
-        "wal-sync-ack-cut" => &[ExactWalPathFault],
-        "manifest-sync-failure" => &[ManifestCheckpointCut],
-        "compaction-commit-cut" => &[FlushCompactionBarrierFault],
-        "wal-prune-cut" => &[CompactionRace],
-        "lease-renewal-failure" => &[LeaseRenewalCut],
+        "recovery-crash-loop" => &[FaultClass::ProcessKill, FaultClass::ForcedReopen],
+        "lease-takeover-latency" => &[
+            FaultClass::ProcessKill,
+            FaultClass::LeaseStalenessWindow,
+            FaultClass::RegionPartition,
+            FaultClass::ProviderLatencySpike,
+        ],
+        "ack-kill-window" => &[FaultClass::AckBeforeReportCrash],
+        "cloud-cache-loss" => &[FaultClass::CloudCacheLoss],
+        "wal-sync-ack-cut" => &[FaultClass::ExactWalPathFault],
+        "manifest-sync-failure" => &[FaultClass::ManifestCheckpointCut],
+        "compaction-commit-cut" => &[FaultClass::FlushCompactionBarrierFault],
+        "wal-prune-cut" => &[FaultClass::CompactionRace],
+        "lease-renewal-failure" => &[FaultClass::LeaseRenewalCut],
         "smoke-local" => &[],
-        "dupe-dispatch" => &[ProcessKill, DroppedWrite],
-        "flush-barrier" => &[FlushCompactionBarrierFault, CompactionRace],
-        "manifest-race" => &[ManifestInterruption],
-        "sst-corruption" => &[SstCorruption],
-        "sqrzl-visibility" => &[ProviderLatencySpike, RegionPartition, LeaseStalenessWindow],
+        "dupe-dispatch" => &[FaultClass::ProcessKill, FaultClass::DroppedWrite],
+        "flush-barrier" => &[
+            FaultClass::FlushCompactionBarrierFault,
+            FaultClass::CompactionRace,
+        ],
+        "manifest-race" => &[FaultClass::ManifestInterruption],
+        "sst-corruption" => &[FaultClass::SstCorruption],
+        "sqrzl-visibility" => &[
+            FaultClass::ProviderLatencySpike,
+            FaultClass::RegionPartition,
+            FaultClass::LeaseStalenessWindow,
+        ],
         _ => FaultClass::all(),
     }
 }
@@ -290,7 +493,7 @@ mod tests {
     #[test]
     fn should_create_expected_fault_density() {
         let plan = DeterministicPlan::from_seed("density", 9, RunScale::Small);
-        let expected = (RunScale::Small.ops() as f64 * 0.15).round() as usize;
+        let expected = default_fault_count(RunScale::Small);
         assert_eq!(plan.scenario.faults.len(), expected);
     }
 
@@ -322,5 +525,48 @@ mod tests {
             assert!(operation.durable);
             assert_eq!(operation.action, MutationAction::Put);
         }
+    }
+
+    #[test]
+    fn should_bound_failpoint_faults_by_scale_concurrency() {
+        // Act
+        let plan = DeterministicPlan::from_seed("lease-renewal-failure", 1, RunScale::Medium);
+
+        // Assert
+        assert_eq!(plan.scenario.faults.len(), RunScale::Medium.concurrency());
+    }
+
+    #[test]
+    fn should_include_every_applicable_black_box_scenario_in_standard_suite() {
+        // Act
+        let local = suite_scenarios(SuitePreset::Standard, BackendKind::Local, false);
+        let s3 = suite_scenarios(SuitePreset::Standard, BackendKind::S3, false);
+        let local_names = local
+            .iter()
+            .map(|selection| selection.definition.name)
+            .collect::<Vec<_>>();
+        let s3_names = s3
+            .iter()
+            .map(|selection| selection.definition.name)
+            .collect::<Vec<_>>();
+
+        // Assert
+        assert!(local_names.contains(&"lease-takeover-latency"));
+        assert!(!local_names.contains(&"cloud-cache-loss"));
+        assert!(s3_names.contains(&"lease-takeover-latency"));
+        assert!(s3_names.contains(&"cloud-cache-loss"));
+        assert!(s3_names.contains(&"sqrzl-visibility"));
+    }
+
+    #[test]
+    fn should_report_failpoint_scenarios_as_skipped_when_feature_is_disabled() {
+        // Act
+        let selections = suite_scenarios(SuitePreset::Standard, BackendKind::Local, false);
+
+        // Assert
+        assert!(selections.iter().any(|selection| {
+            selection.definition.name == "wal-sync-ack-cut"
+                && matches!(selection.availability, ScenarioAvailability::Skipped { .. })
+        }));
     }
 }
