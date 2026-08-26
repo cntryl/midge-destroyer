@@ -177,6 +177,7 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
     let mut segment_index = 0usize;
     let mut observed: Vec<OperationReport> = Vec::new();
     let mut timed_out = false;
+    let mut execution_incomplete = false;
     let mut recovery_verified = false;
     let mut verification_incomplete = false;
     let mut faults = plan.scenario.faults.clone();
@@ -272,6 +273,7 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
                 ));
                 if let Err(error) = apply_fault(&db_path, fault) {
                     notes.push(format!("fault {:?} was not applied: {error}", fault.class));
+                    execution_incomplete = true;
                     break;
                 }
                 start = if matches!(fault.class, FaultClass::AckBeforeReportCrash) {
@@ -284,11 +286,13 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
                 continue;
             }
             notes.push("worker crashed without an expected fault trigger".to_string());
+            execution_incomplete = true;
             break;
         }
 
         if status == WorkerStatus::Failed {
             notes.push("worker process failed".to_string());
+            execution_incomplete = true;
             break;
         }
 
@@ -353,7 +357,7 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
         }
     }
 
-    if timed_out {
+    if timed_out || execution_incomplete {
         ledger.classify_reports_after_timeout(&observed);
     } else {
         ledger.classify_reports(&observed);

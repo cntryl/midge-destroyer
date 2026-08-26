@@ -292,7 +292,9 @@ fn graceful_shutdown_timeout(cloud_provider: &str) -> Duration {
     if cloud_provider == "local" {
         Duration::from_secs(2)
     } else {
-        Duration::from_secs(10)
+        // Cloud WAL sealing has a 30-second minimum proof budget. Leave
+        // caller-side headroom for provider latency and lease fencing.
+        Duration::from_secs(45)
     }
 }
 
