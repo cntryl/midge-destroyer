@@ -92,6 +92,7 @@ pub struct ScenarioConfig {
     pub cloud: BackendKind,
     pub scale: RunScale,
     pub max_runtime_ms: u64,
+    pub recovery_timeout_ms: u64,
     pub fault_window_ms: u64,
     pub cloud_only_manual: bool,
     pub continue_on_failure: bool,

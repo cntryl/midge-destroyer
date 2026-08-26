@@ -25,6 +25,8 @@ pub enum FaultClass {
     FlushCompactionBarrierFault,
     LeaseRenewalCut,
     MigrationBoundaryFault,
+    AckBeforeReportCrash,
+    CloudCacheLoss,
 }
 
 impl FaultClass {
@@ -46,7 +48,9 @@ impl FaultClass {
             Self::SstCorruption | Self::ExactWalPathFault | Self::ManifestCheckpointCut => {
                 FaultExpectation::SafetyPreserved
             }
-            Self::ProviderLatencySpike => FaultExpectation::SafetyPreserved,
+            Self::ProviderLatencySpike | Self::AckBeforeReportCrash | Self::CloudCacheLoss => {
+                FaultExpectation::SafetyPreserved
+            }
         }
     }
 
@@ -70,6 +74,8 @@ impl FaultClass {
             FlushCompactionBarrierFault,
             LeaseRenewalCut,
             MigrationBoundaryFault,
+            AckBeforeReportCrash,
+            CloudCacheLoss,
         ];
         FAULTS
     }
@@ -179,12 +185,31 @@ impl DeterministicPlan {
         let mut rng = SmallRng::seed_from_u64(seed);
         let mut scenario = Scenario::new(name, seed, scale);
 
-        let fault_count = if name == "smoke-local" {
-            0
-        } else {
-            (scale.ops() as f64 * 0.15).round() as usize
+        let fault_count = match (name, scale) {
+            ("smoke-local", _) => 0,
+            ("recovery-crash-loop", RunScale::Small) => 1,
+            ("recovery-crash-loop", RunScale::Medium) => 2,
+            ("recovery-crash-loop", RunScale::Large) => 4,
+            ("recovery-crash-loop", RunScale::XLarge) => 8,
+            ("ack-kill-window" | "cloud-cache-loss", RunScale::Small) => 1,
+            ("ack-kill-window" | "cloud-cache-loss", RunScale::Medium) => 2,
+            ("ack-kill-window" | "cloud-cache-loss", RunScale::Large) => 4,
+            ("ack-kill-window" | "cloud-cache-loss", RunScale::XLarge) => 8,
+            _ => (scale.ops() as f64 * 0.15).round() as usize,
         };
-        let mut candidates: Vec<usize> = (0..scale.ops()).collect();
+        let mut candidates: Vec<usize> = if name == "ack-kill-window" {
+            scenario
+                .operations
+                .iter()
+                .enumerate()
+                .filter(|(_, operation)| {
+                    operation.durable && operation.action == MutationAction::Put
+                })
+                .map(|(index, _)| index)
+                .collect()
+        } else {
+            (0..scale.ops()).collect()
+        };
         candidates.shuffle(&mut rng);
         let mut faults = Vec::with_capacity(fault_count.min(candidates.len()));
 
@@ -227,10 +252,17 @@ fn fault_catalog(name: &str) -> &'static [FaultClass] {
     use FaultClass::*;
     match name {
         "recovery-crash-loop" => &[ProcessKill, ForcedReopen],
+        "ack-kill-window" => &[AckBeforeReportCrash],
+        "cloud-cache-loss" => &[CloudCacheLoss],
+        "wal-sync-ack-cut" => &[ExactWalPathFault],
+        "manifest-sync-failure" => &[ManifestCheckpointCut],
+        "compaction-commit-cut" => &[FlushCompactionBarrierFault],
+        "wal-prune-cut" => &[CompactionRace],
+        "lease-renewal-failure" => &[LeaseRenewalCut],
         "smoke-local" => &[],
         "dupe-dispatch" => &[ProcessKill, DroppedWrite],
         "flush-barrier" => &[FlushCompactionBarrierFault, CompactionRace],
-        "manifest-race" => &[ManifestInterruption, ManifestCheckpointCut],
+        "manifest-race" => &[ManifestInterruption],
         "sst-corruption" => &[SstCorruption],
         "sqrzl-visibility" => &[ProviderLatencySpike, RegionPartition, LeaseStalenessWindow],
         _ => FaultClass::all(),
@@ -269,5 +301,26 @@ mod tests {
             fault.class,
             FaultClass::ProcessKill | FaultClass::ForcedReopen
         )));
+        assert_eq!(plan.scenario.faults.len(), 1);
+    }
+
+    #[test]
+    fn should_target_durable_puts_for_ack_kill_window() {
+        // Arrange
+        let plan = DeterministicPlan::from_seed("ack-kill-window", 1, RunScale::Medium);
+
+        // Act
+        let targeted = plan
+            .scenario
+            .faults
+            .iter()
+            .map(|fault| (&fault.class, &plan.scenario.operations[fault.step]));
+
+        // Assert
+        for (class, operation) in targeted {
+            assert_eq!(*class, FaultClass::AckBeforeReportCrash);
+            assert!(operation.durable);
+            assert_eq!(operation.action, MutationAction::Put);
+        }
     }
 }

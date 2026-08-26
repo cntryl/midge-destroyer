@@ -1,4 +1,5 @@
 use crate::ledger::OutcomeClassifier;
+use crate::worker_protocol::LifecycleReport;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,6 +15,37 @@ pub struct ScenarioReport {
     #[serde(default)]
     pub duration_ms: u128,
     pub notes: Vec<String>,
+    #[serde(default)]
+    pub lifecycle: Option<LifecycleSummary>,
+    #[serde(default)]
+    pub timed_out: bool,
+    #[serde(default)]
+    pub recovery_verified: bool,
+    #[serde(default)]
+    pub verification_incomplete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LifecycleSummary {
+    pub segments: usize,
+    pub total_ms: u128,
+    pub open_ms: u128,
+    pub mutations_ms: u128,
+    pub verification_ms: u128,
+    pub shutdown_ms: u128,
+}
+
+impl LifecycleSummary {
+    pub fn from_reports(reports: &[LifecycleReport]) -> Self {
+        Self {
+            segments: reports.len(),
+            total_ms: reports.iter().map(|r| r.total_ms).sum(),
+            open_ms: reports.iter().map(|r| r.open_ms).sum(),
+            mutations_ms: reports.iter().map(|r| r.mutations_ms).sum(),
+            verification_ms: reports.iter().map(|r| r.verification_ms).sum(),
+            shutdown_ms: reports.iter().map(|r| r.shutdown_ms).sum(),
+        }
+    }
 }
 
 impl ScenarioReport {
@@ -40,6 +72,10 @@ impl ScenarioReport {
             passed,
             duration_ms: 0,
             notes,
+            lifecycle: None,
+            timed_out: false,
+            recovery_verified: false,
+            verification_incomplete: false,
         }
     }
 }

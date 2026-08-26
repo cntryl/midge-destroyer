@@ -20,6 +20,9 @@ fn main() -> Result<()> {
             with_emulator(backend, || {
                 let result = run_scenario(cfg, artifacts_root)?;
                 print_run_report(&result.report);
+                if !result.report.passed {
+                    anyhow::bail!("scenario failed; artifacts={}", result.report.artifacts_dir);
+                }
                 Ok(())
             })?;
         }
@@ -180,5 +183,12 @@ fn print_run_report(report: &ScenarioReport) {
         report.classifier.unknown,
         report.classifier.duplicate,
         report.classifier.missing,
+    );
+    println!(
+        "timed_out={} recovery_verified={} verification_incomplete={} duration_ms={}",
+        report.timed_out,
+        report.recovery_verified,
+        report.verification_incomplete,
+        report.duration_ms
     );
 }

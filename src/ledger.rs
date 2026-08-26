@@ -1,4 +1,4 @@
-use crate::worker_protocol::ObservedOutcome;
+use crate::worker_protocol::{ObservedOutcome, OperationReport, ReportPhase};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -75,6 +75,81 @@ impl Ledger {
     }
 
     pub fn classify(&mut self, observed: &[ObservedOutcome]) {
+        self.classify_with_unobserved(observed, MutationOutcome::Missing);
+    }
+
+    pub fn classify_after_timeout(&mut self, observed: &[ObservedOutcome]) {
+        self.classify_with_unobserved(observed, MutationOutcome::Unknown);
+    }
+
+    pub fn classify_reports(&mut self, observed: &[OperationReport]) {
+        self.classify_reports_with_unobserved(observed, MutationOutcome::Missing);
+    }
+
+    pub fn classify_reports_after_timeout(&mut self, observed: &[OperationReport]) {
+        self.classify_reports_with_unobserved(observed, MutationOutcome::Unknown);
+    }
+
+    fn classify_reports_with_unobserved(
+        &mut self,
+        observed: &[OperationReport],
+        unobserved: MutationOutcome,
+    ) {
+        let mut mutation_ids = HashSet::new();
+        for report in observed {
+            match report.phase {
+                ReportPhase::Lifecycle => continue,
+                ReportPhase::Verification => match &report.outcome {
+                    ObservedOutcome::Failed { .. } => {
+                        self.mark(report.operation_id, MutationOutcome::Failed);
+                    }
+                    ObservedOutcome::Unknown { .. } => {
+                        self.mark(report.operation_id, MutationOutcome::Unknown);
+                    }
+                    ObservedOutcome::Acked { .. } => {
+                        if let Some(entry) = self
+                            .entries
+                            .iter_mut()
+                            .find(|entry| entry.operation_id == report.operation_id)
+                        {
+                            if matches!(
+                                entry.classification,
+                                MutationOutcome::Dispatched
+                                    | MutationOutcome::Unknown
+                                    | MutationOutcome::Missing
+                            ) {
+                                entry.classification = MutationOutcome::Acked;
+                            }
+                        }
+                    }
+                },
+                ReportPhase::Mutation => {
+                    if !mutation_ids.insert(report.operation_id) {
+                        self.mark(report.operation_id, MutationOutcome::Duplicate);
+                        continue;
+                    }
+                    let outcome = match &report.outcome {
+                        ObservedOutcome::Acked { .. } => MutationOutcome::Acked,
+                        ObservedOutcome::Failed { .. } => MutationOutcome::Failed,
+                        ObservedOutcome::Unknown { .. } => MutationOutcome::Unknown,
+                    };
+                    self.mark(report.operation_id, outcome);
+                }
+            }
+        }
+
+        for entry in &mut self.entries {
+            if matches!(entry.classification, MutationOutcome::Dispatched) {
+                entry.classification = unobserved.clone();
+            }
+        }
+    }
+
+    fn classify_with_unobserved(
+        &mut self,
+        observed: &[ObservedOutcome],
+        unobserved: MutationOutcome,
+    ) {
         let mut observed_ids = HashSet::new();
         for sample in observed {
             if !observed_ids.insert(sample.operation_id()) {
@@ -92,7 +167,7 @@ impl Ledger {
 
         for entry in &mut self.entries {
             if matches!(entry.classification, MutationOutcome::Dispatched) {
-                entry.classification = MutationOutcome::Missing;
+                entry.classification = unobserved.clone();
             }
         }
     }
@@ -143,7 +218,7 @@ impl OutcomeClassifier {
     }
 
     pub fn is_strictly_safe(&self) -> bool {
-        self.failed == 0 && self.unknown == 0 && self.missing == 0
+        self.failed == 0 && self.unknown == 0 && self.duplicate == 0 && self.missing == 0
     }
 }
 
@@ -221,5 +296,98 @@ mod tests {
             ledger.by_id().get(&4).unwrap().classification,
             MutationOutcome::Missing
         );
+    }
+
+    #[test]
+    fn should_classify_unobserved_outcomes_as_unknown_after_timeout() {
+        // Arrange
+        let mut ledger = Ledger::with_entries(vec![LedgerEntry {
+            operation_id: 1,
+            sequence: 0,
+            classification: MutationOutcome::Dispatched,
+            key: "k1".to_string(),
+            value: "v1".to_string(),
+        }]);
+
+        // Act
+        ledger.classify_after_timeout(&[]);
+
+        // Assert
+        assert_eq!(ledger.entries[0].classification, MutationOutcome::Unknown);
+    }
+
+    #[test]
+    fn should_prefer_verification_failure_over_mutation_ack() {
+        // Arrange
+        let mut ledger = Ledger::with_entries(vec![LedgerEntry {
+            operation_id: 1,
+            sequence: 0,
+            classification: MutationOutcome::Dispatched,
+            key: "k1".to_string(),
+            value: "v1".to_string(),
+        }]);
+        let reports = vec![
+            OperationReport {
+                operation_id: 1,
+                sequence: 0,
+                key: "k1".to_string(),
+                phase: ReportPhase::Mutation,
+                outcome: ObservedOutcome::Acked {
+                    operation_id: 1,
+                    sequence: 0,
+                    key: "k1".to_string(),
+                },
+            },
+            OperationReport {
+                operation_id: 1,
+                sequence: 0,
+                key: "k1".to_string(),
+                phase: ReportPhase::Verification,
+                outcome: ObservedOutcome::Failed {
+                    operation_id: 1,
+                    sequence: 0,
+                    key: "k1".to_string(),
+                    error: "missing after recovery".to_string(),
+                },
+            },
+        ];
+
+        // Act
+        ledger.classify_reports(&reports);
+
+        // Assert
+        let classifier = OutcomeClassifier::from_ledger(&ledger);
+        assert_eq!(classifier.failed, 1);
+        assert_eq!(classifier.duplicate, 0);
+        assert!(!classifier.is_strictly_safe());
+    }
+
+    #[test]
+    fn should_accept_verified_put_when_ack_was_lost_with_worker() {
+        // Arrange
+        let mut ledger = Ledger::with_entries(vec![LedgerEntry {
+            operation_id: 1,
+            sequence: 0,
+            classification: MutationOutcome::Dispatched,
+            key: "k1".to_string(),
+            value: "v1".to_string(),
+        }]);
+        let reports = vec![OperationReport {
+            operation_id: 1,
+            sequence: 0,
+            key: "k1".to_string(),
+            phase: ReportPhase::Verification,
+            outcome: ObservedOutcome::Acked {
+                operation_id: 1,
+                sequence: 0,
+                key: "k1".to_string(),
+            },
+        }];
+
+        // Act
+        ledger.classify_reports(&reports);
+
+        // Assert
+        assert_eq!(ledger.entries[0].classification, MutationOutcome::Acked);
     }
 }

@@ -13,9 +13,19 @@ Midge-specific adversarial correctness and recovery harness.
 
 ## CLI
 
-- `destroyer run <scenario> --cloud <local|sqrzl|s3|azure|gcs> --seed <u64> --scale <small|medium|large|x-large>`
+- `destroyer run <scenario> --cloud <local|sqrzl|s3|azure|gcs> --seed <u64> --scale <small|medium|large|xlarge>`
 - `destroyer suite <smoke|standard|soak> --report-json`
 - `destroyer report --report-json`
+- `destroyer frontier <scenario|all> --max-scale <small|medium|large|xlarge>`
+
+Executable black-box scenarios include `recovery-crash-loop`, `ack-kill-window`,
+`cloud-cache-loss`, `manifest-race`, and `sst-corruption`.
+`cloud-cache-loss` requires `s3`, `azure`, `gcs`, or another cloud backend.
+
+Exact engine-cut scenarios require `--features failpoint-tier`:
+`wal-sync-ack-cut`, `manifest-sync-failure`, `compaction-commit-cut`,
+`wal-prune-cut`, `lease-renewal-failure`, and `flush-barrier`. These refuse to
+run when the feature is absent.
 
 ## Semantics (Midge-specific)
 

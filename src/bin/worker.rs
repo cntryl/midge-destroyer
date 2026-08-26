@@ -8,9 +8,10 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use midge_destroyer::worker_protocol::LifecycleReport;
 use midge_destroyer::{
     failpoint,
-    worker_protocol::{ObservedOutcome, OperationReport, WorkerCommand},
+    worker_protocol::{ObservedOutcome, OperationReport, ReportPhase, WorkerCommand},
 };
 
 #[derive(Debug, Parser)]
@@ -29,13 +30,22 @@ struct WorkerArgs {
     crash_on_step: Option<usize>,
 
     #[arg(long)]
+    crash_after_step: Option<usize>,
+
+    #[arg(long)]
     interrupt_on_step: Option<usize>,
 
     #[arg(long, default_value = "local")]
     cloud_provider: String,
 
+    #[arg(long, default_value = "destroyer")]
+    cloud_prefix: String,
+
     #[arg(long)]
     verify_commands: Option<PathBuf>,
+
+    #[arg(long)]
+    lifecycle_report: PathBuf,
 }
 
 fn main() {
@@ -62,6 +72,7 @@ fn main() {
         Err(error) => {
             let _ = emit_error(
                 &mut report_file,
+                ReportPhase::Lifecycle,
                 ObservedOutcome::Failed {
                     operation_id: 0,
                     sequence: 0,
@@ -78,6 +89,7 @@ fn main() {
         Err(err) => {
             let _ = emit_error(
                 &mut report_file,
+                ReportPhase::Lifecycle,
                 ObservedOutcome::Failed {
                     operation_id: 0,
                     sequence: 0,
@@ -95,6 +107,7 @@ fn main() {
         Err(error) => {
             let _ = emit_error(
                 &mut report_file,
+                ReportPhase::Lifecycle,
                 ObservedOutcome::Failed {
                     operation_id: 0,
                     sequence: 0,
@@ -114,14 +127,16 @@ fn run_engine(
     report_file: &mut std::fs::File,
     args: &WorkerArgs,
 ) -> Result<bool, String> {
+    let total_started = std::time::Instant::now();
+    let options_started = std::time::Instant::now();
     let open_options = match args.cloud_provider.as_str() {
         "local" => OpenOptions::local(&args.db_root),
         "sqrzl" => {
             OpenOptions::cloud_simulated(&args.db_root, "midge-destroyer-cloud", "destroyer")
         }
-        "s3" => provider_options(&args.db_root, s3_provider()),
-        "azure" => provider_options(&args.db_root, azure_provider()),
-        "gcs" => provider_options(&args.db_root, gcs_provider()?),
+        "s3" => provider_options(&args.db_root, s3_provider(), &args.cloud_prefix),
+        "azure" => provider_options(&args.db_root, azure_provider(), &args.cloud_prefix),
+        "gcs" => provider_options(&args.db_root, gcs_provider()?, &args.cloud_prefix),
         other => return Err(format!("unsupported cloud provider: {other}")),
     }
     // Keep production lease fencing semantics, but remove the additional
@@ -129,35 +144,98 @@ fn run_engine(
     .lease_clock_skew_tolerance(Duration::ZERO)
     .build()
     .map_err(|error| error.to_string())?;
+    let options_ms = options_started.elapsed().as_millis();
 
+    let open_started = std::time::Instant::now();
     let mut engine = cntryl_midge::Engine::open(open_options).map_err(|error| error.to_string())?;
+    let open_ms = open_started.elapsed().as_millis();
     let cf = engine
         .get_column_family("default")
         .ok_or_else(|| "default column family not found".to_string())?;
 
+    let mutations_started = std::time::Instant::now();
+    let mut first_mutation_ms = None;
     for (index, command) in commands.iter().enumerate() {
         if Some(index) == args.crash_on_step {
+            write_lifecycle(
+                args,
+                LifecycleReport {
+                    schema_version: "midge-destroyer.lifecycle/v1".to_string(),
+                    options_ms,
+                    open_ms,
+                    mutations_ms: mutations_started.elapsed().as_millis(),
+                    first_mutation_ms,
+                    verification_ms: 0,
+                    shutdown_ms: 0,
+                    total_ms: total_started.elapsed().as_millis(),
+                    operations_completed: index,
+                    interrupted: false,
+                    crashed: true,
+                },
+            )?;
             std::process::exit(1);
         }
         if Some(index) == args.interrupt_on_step {
-            engine
-                .shutdown(Duration::from_secs(2))
-                .map_err(|error| error.to_string())?;
+            let mutations_ms = mutations_started.elapsed().as_millis();
+            let shutdown_started = std::time::Instant::now();
+            let shutdown_result = engine.shutdown(graceful_shutdown_timeout(&args.cloud_provider));
+            let shutdown_ms = shutdown_started.elapsed().as_millis();
+            write_lifecycle(
+                args,
+                LifecycleReport {
+                    schema_version: "midge-destroyer.lifecycle/v1".to_string(),
+                    options_ms,
+                    open_ms,
+                    mutations_ms,
+                    first_mutation_ms,
+                    verification_ms: 0,
+                    shutdown_ms,
+                    total_ms: total_started.elapsed().as_millis(),
+                    operations_completed: index,
+                    interrupted: true,
+                    crashed: false,
+                },
+            )?;
+            shutdown_result.map_err(|error| error.to_string())?;
             return Ok(true);
         }
 
+        let mutation_started = std::time::Instant::now();
         let outcome = execute_command(
             &engine,
             &cf,
             command,
             args.cloud_provider.as_str() != "local",
         );
+        if first_mutation_ms.is_none() {
+            first_mutation_ms = Some(mutation_started.elapsed().as_millis());
+        }
+        if Some(index) == args.crash_after_step {
+            write_lifecycle(
+                args,
+                LifecycleReport {
+                    schema_version: "midge-destroyer.lifecycle/v1".to_string(),
+                    options_ms,
+                    open_ms,
+                    mutations_ms: mutations_started.elapsed().as_millis(),
+                    first_mutation_ms,
+                    verification_ms: 0,
+                    shutdown_ms: 0,
+                    total_ms: total_started.elapsed().as_millis(),
+                    operations_completed: index + 1,
+                    interrupted: false,
+                    crashed: true,
+                },
+            )?;
+            std::process::exit(1);
+        }
         match &outcome {
             ObservedOutcome::Acked { .. } | ObservedOutcome::Failed { .. } => {
                 let report = OperationReport {
                     operation_id: command.operation_id,
                     sequence: command.sequence,
                     key: command.key.clone(),
+                    phase: ReportPhase::Mutation,
                     outcome,
                 };
                 if let Ok(json) = serde_json::to_string(&report) {
@@ -176,26 +254,61 @@ fn run_engine(
         }
     }
 
+    let mutations_ms = mutations_started.elapsed().as_millis();
+    let verification_started = std::time::Instant::now();
     if let Some(path) = &args.verify_commands {
         let raw = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
         let all_commands: Vec<WorkerCommand> =
             serde_json::from_str(&raw).map_err(|error| error.to_string())?;
         verify_final_state(&engine, &cf, &all_commands, report_file)?;
     }
+    let verification_ms = verification_started.elapsed().as_millis();
 
-    let _ = engine
-        .shutdown(Duration::from_millis(500))
-        .map_err(|error| error.to_string());
+    let shutdown_started = std::time::Instant::now();
+    let shutdown_result = engine.shutdown(graceful_shutdown_timeout(&args.cloud_provider));
+    let shutdown_ms = shutdown_started.elapsed().as_millis();
+    write_lifecycle(
+        args,
+        LifecycleReport {
+            schema_version: "midge-destroyer.lifecycle/v1".to_string(),
+            options_ms,
+            open_ms,
+            mutations_ms,
+            first_mutation_ms,
+            verification_ms,
+            shutdown_ms,
+            total_ms: total_started.elapsed().as_millis(),
+            operations_completed: commands.len(),
+            interrupted: false,
+            crashed: false,
+        },
+    )?;
+    shutdown_result.map_err(|error| error.to_string())?;
 
     Ok(false)
+}
+
+fn graceful_shutdown_timeout(cloud_provider: &str) -> Duration {
+    if cloud_provider == "local" {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(10)
+    }
+}
+
+fn write_lifecycle(args: &WorkerArgs, report: LifecycleReport) -> Result<(), String> {
+    std::fs::write(
+        &args.lifecycle_report,
+        serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn provider_options(
     cache: &std::path::Path,
     provider: CloudProviderConfig,
+    prefix: &str,
 ) -> cntryl_midge::OpenOptionsBuilder {
-    let prefix =
-        std::env::var("MIDGE_DESTROYER_CLOUD_PREFIX").unwrap_or_else(|_| "destroyer".to_string());
     OpenOptions::cloud(cache, CloudStorageLocation::new(provider, prefix))
 }
 
@@ -250,6 +363,7 @@ fn verify_final_state(
             let (operation_id, sequence) = identities[&key];
             emit_error(
                 report_file,
+                ReportPhase::Verification,
                 ObservedOutcome::Failed {
                     operation_id,
                     sequence,
@@ -260,11 +374,28 @@ fn verify_final_state(
             .map_err(|error| error.to_string())?;
             return Err(format!("recovery verification failed for key {key}"));
         }
+        if expected_value.is_some() {
+            let (operation_id, sequence) = identities[&key];
+            emit_error(
+                report_file,
+                ReportPhase::Verification,
+                ObservedOutcome::Acked {
+                    operation_id,
+                    sequence,
+                    key: key.clone(),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        }
     }
     Ok(())
 }
 
-fn emit_error(report_file: &mut std::fs::File, outcome: ObservedOutcome) -> std::io::Result<()> {
+fn emit_error(
+    report_file: &mut std::fs::File,
+    phase: ReportPhase,
+    outcome: ObservedOutcome,
+) -> std::io::Result<()> {
     let (operation_id, sequence, key) = match &outcome {
         ObservedOutcome::Acked {
             operation_id,
@@ -287,6 +418,7 @@ fn emit_error(report_file: &mut std::fs::File, outcome: ObservedOutcome) -> std:
         operation_id,
         sequence,
         key,
+        phase,
         outcome,
     };
     let line = serde_json::to_string(&entry)?;

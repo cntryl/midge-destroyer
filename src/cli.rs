@@ -100,6 +100,10 @@ pub struct FrontierArgs {
     pub seeds: usize,
     #[arg(long, default_value_t = 1)]
     pub seed_start: u64,
+    #[arg(long, default_value_t = 60)]
+    pub recovery_timeout_secs: u64,
+    #[arg(long, value_enum, default_value_t = ScaleArg::XLarge)]
+    pub max_scale: ScaleArg,
 }
 
 #[derive(Debug, Args)]
@@ -117,6 +121,9 @@ pub struct RunArgs {
 
     #[arg(long)]
     pub continue_on_failure: bool,
+
+    #[arg(long, default_value_t = 60)]
+    pub recovery_timeout_secs: u64,
 }
 
 #[derive(Debug, Args)]
@@ -132,6 +139,9 @@ pub struct SuiteArgs {
 
     #[arg(long)]
     pub max_scenarios: Option<usize>,
+
+    #[arg(long, default_value_t = 60)]
+    pub recovery_timeout_secs: u64,
 }
 
 #[derive(Debug, Args)]
@@ -161,6 +171,7 @@ impl RunArgs {
                 cloud: self.cloud.clone().into(),
                 scale,
                 max_runtime_ms: scale.max_runtime_ms(),
+                recovery_timeout_ms: self.recovery_timeout_secs.saturating_mul(1_000),
                 fault_window_ms: 250,
                 cloud_only_manual: matches!(self.cloud, CloudArg::Sqrzl),
                 continue_on_failure: self.continue_on_failure,
