@@ -1,0 +1,17 @@
+services:
+  sqrzl:
+    image: ghcr.io/sqrzl/sqrzl-emulator:latest
+    hostname: sqrzl
+    environment:
+      SQRZL_BLOBS_PATH: /app/blobs
+      SQRZL_ACCESS_KEY_ID: admin
+      SQRZL_SECRET_ACCESS_KEY: easy-peasy
+      SQRZL_BUCKET_LIST: midge-destroyer
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - midge-azure-data:/app/blobs
+
+volumes:
+  midge-azure-data:

@@ -1,0 +1,30 @@
+/target/
+/artifacts/
+
+# Local emulator and coverage output
+/.docker/
+/coverage/
+/test-results/
+*.profraw
+*.profdata
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Editors and operating systems
+.idea/
+.vscode/
+.rust-analyzer/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Rust tooling
+**/*.rs.bk
+flamegraph.svg
+perf.data*
+
