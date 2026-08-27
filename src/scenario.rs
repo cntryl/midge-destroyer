@@ -306,9 +306,10 @@ pub struct DeterministicPlan {
 impl Scenario {
     #[must_use]
     pub fn new(name: &str, seed: u64, scale: RunScale) -> Self {
+        let key_count = workload_key_count(scale);
         let mut ops = Vec::new();
         for i in 0..scale.ops() {
-            let action = if i % 11 == 0 {
+            let action = if i >= key_count && i % 11 == 0 {
                 MutationAction::Delete
             } else {
                 MutationAction::Put
@@ -319,7 +320,7 @@ impl Scenario {
                 id: seed.wrapping_mul(10_007).wrapping_add(i as u64),
                 sequence: i,
                 action,
-                key: format!("k{seed:016x}-{i:04}"),
+                key: format!("k{seed:016x}-{:04}", i % key_count),
                 value: if is_put {
                     Some(format!("v{seed:016x}-{i:04}"))
                 } else {
@@ -367,15 +368,7 @@ impl DeterministicPlan {
 
         let fault_count = scenario_fault_count(name, scale);
         let mut candidates: Vec<usize> = if name == "ack-kill-window" {
-            scenario
-                .operations
-                .iter()
-                .enumerate()
-                .filter(|(_, operation)| {
-                    operation.durable && operation.action == MutationAction::Put
-                })
-                .map(|(index, _)| index)
-                .collect()
+            final_durable_puts(&scenario.operations)
         } else {
             (0..scale.ops()).collect()
         };
@@ -418,6 +411,24 @@ impl DeterministicPlan {
             })
             .collect()
     }
+}
+
+fn workload_key_count(scale: RunScale) -> usize {
+    scale.concurrency().saturating_mul(4)
+}
+
+fn final_durable_puts(operations: &[MutationOp]) -> Vec<usize> {
+    let mut final_by_key = std::collections::BTreeMap::new();
+    for (index, operation) in operations.iter().enumerate() {
+        final_by_key.insert(operation.key.as_str(), index);
+    }
+    final_by_key
+        .into_values()
+        .filter(|index| {
+            let operation = &operations[*index];
+            operation.durable && operation.action == MutationAction::Put
+        })
+        .collect()
 }
 
 fn scenario_fault_count(name: &str, scale: RunScale) -> usize {
@@ -520,11 +531,57 @@ mod tests {
             .map(|fault| (&fault.class, &plan.scenario.operations[fault.step]));
 
         // Assert
+        assert_eq!(plan.scenario.faults.len(), RunScale::Medium.concurrency());
         for (class, operation) in targeted {
             assert_eq!(*class, FaultClass::AckBeforeReportCrash);
             assert!(operation.durable);
             assert_eq!(operation.action, MutationAction::Put);
+            assert!(plan
+                .scenario
+                .operations
+                .iter()
+                .skip(operation.sequence.saturating_add(1))
+                .all(|later| later.key != operation.key));
         }
+    }
+
+    #[test]
+    fn should_reuse_bounded_keyspace_when_generating_workload() {
+        // Arrange
+        let scenario = Scenario::new("recovery-crash-loop", 7, RunScale::Small);
+
+        // Act
+        let distinct_keys = scenario
+            .operations
+            .iter()
+            .map(|operation| operation.key.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        // Assert
+        assert_eq!(distinct_keys.len(), workload_key_count(RunScale::Small));
+        assert!(scenario.operations.len() > distinct_keys.len());
+    }
+
+    #[test]
+    fn should_delete_existing_keys_when_generating_workload() {
+        // Arrange
+        let scenario = Scenario::new("recovery-crash-loop", 7, RunScale::Small);
+
+        // Act
+        let delete_targets_existing_value =
+            scenario
+                .operations
+                .iter()
+                .enumerate()
+                .any(|(index, operation)| {
+                    operation.action == MutationAction::Delete
+                        && scenario.operations[..index].iter().any(|earlier| {
+                            earlier.key == operation.key && earlier.action == MutationAction::Put
+                        })
+                });
+
+        // Assert
+        assert!(delete_targets_existing_value);
     }
 
     #[test]

@@ -72,11 +72,6 @@ fn main() -> Result<()> {
                 report.first_bend.is_some(),
                 report.first_break.is_some()
             );
-            std::fs::create_dir_all(&artifacts_root)?;
-            std::fs::write(
-                artifacts_root.join("frontier-report.json"),
-                serde_json::to_vec_pretty(&report)?,
-            )?;
         }
     }
 

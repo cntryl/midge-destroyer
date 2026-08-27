@@ -1100,7 +1100,7 @@ pub fn run_frontier(args: FrontierArgs, artifacts_root: PathBuf) -> Result<Front
             break;
         }
     }
-    Ok(FrontierReport {
+    let report = FrontierReport {
         schema_version: "midge-destroyer.frontier/v3".to_string(),
         scenario: args.scenario,
         cloud: format!("{backend:?}"),
@@ -1110,7 +1110,17 @@ pub fn run_frontier(args: FrontierArgs, artifacts_root: PathBuf) -> Result<Front
         first_bend,
         first_break,
         runs,
-    })
+    };
+    write_frontier_manifest(&report)?;
+    Ok(report)
+}
+
+fn write_frontier_manifest(report: &FrontierReport) -> Result<()> {
+    std::fs::write(
+        Path::new(&report.artifacts_dir).join("frontier-manifest.json"),
+        serde_json::to_vec_pretty(report)?,
+    )?;
+    Ok(())
 }
 
 /// Collect only v3 suite manifests beneath an artifact root.
@@ -1436,5 +1446,33 @@ mod tests {
 
         // Assert
         assert!(!lock.exists());
+    }
+
+    #[test]
+    fn should_write_frontier_manifest_inside_unique_execution_directory() {
+        // Arrange
+        let directory = tempfile::tempdir().expect("create frontier directory");
+        let report = FrontierReport {
+            schema_version: "midge-destroyer.frontier/v3".to_string(),
+            scenario: "recovery-crash-loop".to_string(),
+            cloud: "Local".to_string(),
+            artifacts_dir: directory.path().to_string_lossy().into_owned(),
+            seeds_per_scale: 1,
+            first_wobble: None,
+            first_bend: None,
+            first_break: None,
+            runs: Vec::new(),
+        };
+
+        // Act
+        write_frontier_manifest(&report).expect("write frontier manifest");
+
+        // Assert
+        let path = directory.path().join("frontier-manifest.json");
+        let saved: FrontierReport =
+            serde_json::from_slice(&std::fs::read(path).expect("read frontier manifest"))
+                .expect("parse frontier manifest");
+        assert_eq!(saved.schema_version, report.schema_version);
+        assert_eq!(saved.artifacts_dir, report.artifacts_dir);
     }
 }

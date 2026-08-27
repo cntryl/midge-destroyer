@@ -103,7 +103,7 @@ pub enum Command {
     /// Aggregate all existing run reports.
     Report(ReportArgs),
 
-    /// Escalate workload scales and stop at the first wobble/break frontier.
+    /// Escalate workload scales and record the first wobble, bend, and break.
     Frontier(FrontierArgs),
 }
 
