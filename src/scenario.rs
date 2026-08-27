@@ -157,6 +157,13 @@ const SCENARIO_CATALOG: &[ScenarioDefinition] = &[
         smoke: false,
     },
     ScenarioDefinition {
+        name: "uuid-compaction-pressure",
+        applicability: BackendApplicability::Any,
+        required_feature: None,
+        expected_behavior: FaultExpectation::TemporarilyUnavailable,
+        smoke: false,
+    },
+    ScenarioDefinition {
         name: "ack-kill-window",
         applicability: BackendApplicability::Any,
         required_feature: None,
@@ -271,6 +278,15 @@ pub enum MutationAction {
     Noop,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadLane {
+    #[default]
+    Pointwise,
+    Batch,
+    Trickle,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MutationOp {
     pub id: u64,
@@ -279,6 +295,10 @@ pub struct MutationOp {
     pub key: String,
     pub value: Option<String>,
     pub durable: bool,
+    #[serde(default)]
+    pub workload_lane: WorkloadLane,
+    #[serde(default)]
+    pub workload_batch: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -306,6 +326,15 @@ pub struct DeterministicPlan {
 impl Scenario {
     #[must_use]
     pub fn new(name: &str, seed: u64, scale: RunScale) -> Self {
+        if name == "uuid-compaction-pressure" {
+            return Self {
+                name: name.to_string(),
+                seed,
+                scale,
+                operations: mixed_lsm_operations(seed, scale),
+                faults: Vec::new(),
+            };
+        }
         let key_count = workload_key_count(scale);
         let mut ops = Vec::new();
         for i in 0..scale.ops() {
@@ -327,6 +356,8 @@ impl Scenario {
                     None
                 },
                 durable,
+                workload_lane: WorkloadLane::Pointwise,
+                workload_batch: 0,
             });
         }
 
@@ -367,10 +398,10 @@ impl DeterministicPlan {
         let mut scenario = Scenario::new(name, seed, scale);
 
         let fault_count = scenario_fault_count(name, scale);
-        let mut candidates: Vec<usize> = if name == "ack-kill-window" {
-            final_durable_puts(&scenario.operations)
-        } else {
-            (0..scale.ops()).collect()
+        let mut candidates: Vec<usize> = match name {
+            "ack-kill-window" => final_durable_puts(&scenario.operations),
+            "uuid-compaction-pressure" => mixed_lsm_fault_boundaries(scale),
+            _ => (0..scenario.operations.len()).collect(),
         };
         candidates.shuffle(&mut rng);
         let mut faults = Vec::with_capacity(fault_count.min(candidates.len()));
@@ -417,6 +448,110 @@ fn workload_key_count(scale: RunScale) -> usize {
     scale.concurrency().saturating_mul(4)
 }
 
+fn mixed_lsm_operation_count(scale: RunScale) -> usize {
+    scale.ops().saturating_mul(16)
+}
+
+fn mixed_lsm_chunk_size(scale: RunScale) -> usize {
+    scale.concurrency().saturating_mul(32)
+}
+
+fn mixed_lsm_fault_boundaries(scale: RunScale) -> Vec<usize> {
+    let chunk_size = mixed_lsm_chunk_size(scale);
+    (chunk_size..mixed_lsm_operation_count(scale))
+        .step_by(chunk_size)
+        .collect()
+}
+
+fn mixed_lsm_operations(seed: u64, scale: RunScale) -> Vec<MutationOp> {
+    let operation_count = mixed_lsm_operation_count(scale);
+    let chunk_size = mixed_lsm_chunk_size(scale);
+    let batch_width = chunk_size.saturating_mul(3) / 4;
+    let mut batch_live = Vec::<String>::new();
+    let mut trickle_live = Vec::<String>::new();
+    let mut operations = Vec::with_capacity(operation_count);
+
+    for sequence in 0..operation_count {
+        let workload_batch = sequence / chunk_size;
+        let workload_lane = if sequence % chunk_size < batch_width {
+            WorkloadLane::Batch
+        } else {
+            WorkloadLane::Trickle
+        };
+        let live = match workload_lane {
+            WorkloadLane::Batch => &mut batch_live,
+            WorkloadLane::Trickle => &mut trickle_live,
+            WorkloadLane::Pointwise => unreachable!("mixed workload has two explicit lanes"),
+        };
+        let action = if sequence > chunk_size && sequence % 17 == 0 && !live.is_empty() {
+            MutationAction::Delete
+        } else {
+            MutationAction::Put
+        };
+        let key = if action == MutationAction::Delete {
+            let index = deterministic_index(seed, sequence, live.len());
+            live.swap_remove(index)
+        } else if sequence % 7 == 0 && !live.is_empty() {
+            live[deterministic_index(seed.rotate_left(9), sequence, live.len())].clone()
+        } else {
+            let domain = match workload_lane {
+                WorkloadLane::Batch => 0xBA7C_0000_0000_0001,
+                WorkloadLane::Trickle => 0x71CC_1E00_0000_0002,
+                WorkloadLane::Pointwise => unreachable!("mixed workload has two explicit lanes"),
+            };
+            let key = deterministic_uuid(seed ^ domain, sequence as u64);
+            live.push(key.clone());
+            key
+        };
+        let value = (action == MutationAction::Put).then(|| {
+            let payload_bytes = [512_usize, 2_048, 8_192][sequence % 3];
+            format!("v{seed:016x}-{sequence:08x}-{}", "x".repeat(payload_bytes))
+        });
+        let durable = match workload_lane {
+            WorkloadLane::Batch => !workload_batch.is_multiple_of(3),
+            WorkloadLane::Trickle => sequence % 3 != 0,
+            WorkloadLane::Pointwise => false,
+        };
+        operations.push(MutationOp {
+            id: seed.wrapping_mul(10_007).wrapping_add(sequence as u64),
+            sequence,
+            action,
+            key,
+            value,
+            durable,
+            workload_lane,
+            workload_batch,
+        });
+    }
+    operations
+}
+
+fn deterministic_index(seed: u64, sequence: usize, len: usize) -> usize {
+    let mixed = splitmix64(seed.wrapping_add(sequence as u64));
+    usize::try_from(mixed).unwrap_or(usize::MAX) % len
+}
+
+fn deterministic_uuid(seed: u64, sequence: u64) -> String {
+    let high = splitmix64(seed.wrapping_add(sequence.wrapping_mul(2)));
+    let low = splitmix64(seed.wrapping_add(sequence.wrapping_mul(2).wrapping_add(1)));
+    let bits = (u128::from(high) << 64) | u128::from(low);
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        bits >> 96,
+        (bits >> 80) & 0xffff,
+        (bits >> 64) & 0xffff,
+        (bits >> 48) & 0xffff,
+        bits & 0xffff_ffff_ffff
+    )
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
 fn final_durable_puts(operations: &[MutationOp]) -> Vec<usize> {
     let mut final_by_key = std::collections::BTreeMap::new();
     for (index, operation) in operations.iter().enumerate() {
@@ -436,7 +571,11 @@ fn scenario_fault_count(name: &str, scale: RunScale) -> usize {
         0
     } else if matches!(
         name,
-        "recovery-crash-loop" | "lease-takeover-latency" | "ack-kill-window" | "cloud-cache-loss"
+        "recovery-crash-loop"
+            | "lease-takeover-latency"
+            | "uuid-compaction-pressure"
+            | "ack-kill-window"
+            | "cloud-cache-loss"
     ) || scenario_definition(name)
         .is_some_and(|definition| definition.required_feature.is_some())
     {
@@ -452,7 +591,9 @@ fn default_fault_count(scale: RunScale) -> usize {
 
 fn fault_catalog(name: &str) -> &'static [FaultClass] {
     match name {
-        "recovery-crash-loop" => &[FaultClass::ProcessKill, FaultClass::ForcedReopen],
+        "recovery-crash-loop" | "uuid-compaction-pressure" => {
+            &[FaultClass::ProcessKill, FaultClass::ForcedReopen]
+        }
         "lease-takeover-latency" => &[
             FaultClass::ProcessKill,
             FaultClass::LeaseStalenessWindow,
@@ -585,6 +726,82 @@ mod tests {
     }
 
     #[test]
+    fn should_generate_unsorted_uuid_pressure_workload() {
+        // Arrange
+        let scenario = Scenario::new("uuid-compaction-pressure", 77, RunScale::Small);
+
+        // Act
+        let keys = scenario
+            .operations
+            .iter()
+            .map(|operation| operation.key.clone())
+            .collect::<Vec<_>>();
+        let mut sorted_keys = keys.clone();
+        sorted_keys.sort();
+
+        // Assert
+        assert_eq!(scenario.operations.len(), RunScale::Small.ops() * 16);
+        assert_ne!(keys, sorted_keys, "generated UUID keys must not be sorted");
+        assert!(keys.iter().all(|key| {
+            key.len() == 36
+                && key.chars().enumerate().all(|(index, character)| {
+                    [8, 13, 18, 23].contains(&index) && character == '-'
+                        || ![8, 13, 18, 23].contains(&index) && character.is_ascii_hexdigit()
+                })
+        }));
+        assert!(scenario
+            .operations
+            .iter()
+            .any(|operation| operation.workload_lane == WorkloadLane::Batch));
+        assert!(scenario
+            .operations
+            .iter()
+            .any(|operation| operation.workload_lane == WorkloadLane::Trickle));
+        assert!(scenario.operations.iter().any(|operation| {
+            operation
+                .value
+                .as_ref()
+                .is_some_and(|value| value.len() >= 8_192)
+        }));
+    }
+
+    #[test]
+    fn should_align_uuid_pressure_faults_to_completed_chunks() {
+        // Arrange
+        let scale = RunScale::Large;
+        let chunk_size = mixed_lsm_chunk_size(scale);
+
+        // Act
+        let plan = DeterministicPlan::from_seed("uuid-compaction-pressure", 41, scale);
+
+        // Assert
+        assert_eq!(plan.scenario.faults.len(), scale.concurrency());
+        assert!(plan.scenario.faults.iter().all(|fault| {
+            fault.step > 0
+                && fault.step % chunk_size == 0
+                && matches!(
+                    fault.class,
+                    FaultClass::ProcessKill | FaultClass::ForcedReopen
+                )
+        }));
+    }
+
+    #[test]
+    fn should_include_process_kill_in_uuid_pressure_seed_window() {
+        // Act
+        let seed = (0..64).find(|seed| {
+            DeterministicPlan::from_seed("uuid-compaction-pressure", *seed, RunScale::Small)
+                .scenario
+                .faults
+                .iter()
+                .any(|fault| fault.class == FaultClass::ProcessKill)
+        });
+
+        // Assert
+        assert_eq!(seed, Some(0));
+    }
+
+    #[test]
     fn should_bound_failpoint_faults_by_scale_concurrency() {
         // Act
         let plan = DeterministicPlan::from_seed("lease-renewal-failure", 1, RunScale::Medium);
@@ -609,8 +826,10 @@ mod tests {
 
         // Assert
         assert!(local_names.contains(&"lease-takeover-latency"));
+        assert!(local_names.contains(&"uuid-compaction-pressure"));
         assert!(!local_names.contains(&"cloud-cache-loss"));
         assert!(s3_names.contains(&"lease-takeover-latency"));
+        assert!(s3_names.contains(&"uuid-compaction-pressure"));
         assert!(s3_names.contains(&"cloud-cache-loss"));
         assert!(s3_names.contains(&"sqrzl-visibility"));
     }

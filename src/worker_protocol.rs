@@ -1,4 +1,4 @@
-use crate::scenario::MutationAction;
+use crate::scenario::{MutationAction, WorkloadLane};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +68,10 @@ pub struct WorkerCommand {
     pub key: String,
     pub value: Option<String>,
     pub durable: bool,
+    #[serde(default)]
+    pub workload_lane: WorkloadLane,
+    #[serde(default)]
+    pub workload_batch: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
