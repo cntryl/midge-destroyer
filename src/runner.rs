@@ -570,10 +570,16 @@ fn run_worker(
         verify_commands,
         lifecycle_report,
     );
+    let worker_log_path = report_file.with_extension("worker.log");
+    let worker_log = std::fs::File::create(&worker_log_path)
+        .with_context(|| format!("create worker log {}", worker_log_path.display()))?;
+    let worker_error_log = worker_log
+        .try_clone()
+        .with_context(|| format!("clone worker log {}", worker_log_path.display()))?;
     let mut child = command
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(Stdio::from(worker_log))
+        .stderr(Stdio::from(worker_error_log))
         .spawn()
         .context("spawn worker")?;
     let status = loop {

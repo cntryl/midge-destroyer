@@ -125,6 +125,14 @@ fn lease_durations(profile: &str, cloud_provider: &str) -> Result<(Duration, Dur
     }
 }
 
+fn runtime_response_timeout(cloud_provider: &str) -> Duration {
+    if cloud_provider == "local" {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(180)
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_engine(
     commands: &[WorkerCommand],
@@ -167,6 +175,7 @@ fn run_engine(
     let open_options = open_options
         .lease_ttl(lease_ttl)
         .lease_clock_skew_tolerance(lease_skew)
+        .runtime_response_timeout(runtime_response_timeout(&args.cloud_provider))
         .build()
         .map_err(|error| error.to_string())?;
     let options_ms = options_started.elapsed().as_millis();
@@ -608,7 +617,7 @@ fn execute_mixed_chunk(
         .iter()
         .map(|command| command.key.clone())
         .collect::<Vec<_>>();
-    let read_probe_count = chunk.len().saturating_mul(16);
+    let read_probe_count = mixed_read_probe_count(chunk.len());
     let participant_count = if crash_during_chunk { 5 } else { 4 };
     let barrier = Arc::new(Barrier::new(participant_count));
 
@@ -678,6 +687,13 @@ fn workload_chunk_end(commands: &[WorkerCommand], start: usize) -> usize {
         .iter()
         .position(|command| command.workload_batch != workload_batch)
         .map_or(commands.len(), |offset| start.saturating_add(offset))
+}
+
+fn mixed_read_probe_count(chunk_len: usize) -> usize {
+    // Mixed workloads verify read/write overlap. Sustained read saturation is
+    // owned by the dedicated cold-cache-read-storm scenario; keeping this
+    // lane bounded prevents serial emulator RTT from becoming the workload.
+    chunk_len.min(8)
 }
 
 fn execute_snapshot_pinned_chunk(
@@ -932,22 +948,33 @@ fn exercise_read_pressure(
     workload_kind: WorkloadKind,
 ) -> Result<(), String> {
     for probe in 0..read_probe_count {
-        let tx = engine
-            .begin_tx(cf.id(), TransactionMode::ReadOnly)
-            .map_err(|error| error.to_string())?;
-        let key = &keys[probe % keys.len()];
-        let _ = tx.get(key.as_bytes()).map_err(|error| error.to_string())?;
-        if matches!(
-            workload_kind,
-            WorkloadKind::ScanCompaction
-                | WorkloadKind::ColdCacheReadStorm
-                | WorkloadKind::DeleteSpaceAmplification
-        ) && probe.is_multiple_of(keys.len().max(1))
-        {
-            let rows = collect_range_scan(&tx)?;
-            if rows.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
-                return Err("range scan returned non-increasing keys".to_string());
-            }
+        exercise_read_probe(engine, cf, keys, probe, workload_kind)?;
+    }
+    Ok(())
+}
+
+fn exercise_read_probe(
+    engine: &cntryl_midge::Engine,
+    cf: &cntryl_midge::ColumnFamilyHandle,
+    keys: &[String],
+    probe: usize,
+    workload_kind: WorkloadKind,
+) -> Result<(), String> {
+    let tx = engine
+        .begin_tx(cf.id(), TransactionMode::ReadOnly)
+        .map_err(|error| error.to_string())?;
+    let key = &keys[probe % keys.len()];
+    let _ = tx.get(key.as_bytes()).map_err(|error| error.to_string())?;
+    if matches!(
+        workload_kind,
+        WorkloadKind::ScanCompaction
+            | WorkloadKind::ColdCacheReadStorm
+            | WorkloadKind::DeleteSpaceAmplification
+    ) && probe.is_multiple_of(keys.len().max(1))
+    {
+        let rows = collect_range_scan(&tx)?;
+        if rows.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Err("range scan returned non-increasing keys".to_string());
         }
     }
     Ok(())
@@ -963,10 +990,14 @@ fn apply_lsm_maintenance(
         return Ok(());
     }
     engine.flush_cf(cf).map_err(|error| error.to_string())?;
-    if workload_batch.is_multiple_of(4) || workload_kind == WorkloadKind::DeleteSpaceAmplification {
+    if should_force_manual_compaction(workload_kind) {
         engine.compact_all().map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+fn should_force_manual_compaction(workload_kind: WorkloadKind) -> bool {
+    matches!(workload_kind, WorkloadKind::DeleteSpaceAmplification)
 }
 
 fn failed_outcomes(commands: &[&WorkerCommand], error: &str) -> Vec<ObservedOutcome> {
@@ -1056,9 +1087,13 @@ fn execute_command(
 
 #[cfg(test)]
 mod tests {
-    use super::{lease_durations, required_column_family_names};
+    use super::{
+        lease_durations, mixed_read_probe_count, required_column_family_names,
+        runtime_response_timeout, should_force_manual_compaction,
+    };
     use midge_destroyer::scenario::{MutationAction, WorkloadKind, WorkloadLane};
     use midge_destroyer::worker_protocol::WorkerCommand;
+    use std::time::Duration;
 
     fn command(column_family: &str) -> WorkerCommand {
         WorkerCommand {
@@ -1106,5 +1141,34 @@ mod tests {
             lease_durations("bounded-failover", "s3").expect("cloud bounded profile");
         assert_eq!(cloud_ttl.as_millis(), 30_000);
         assert_eq!(cloud_skew.as_millis(), 5_000);
+    }
+
+    #[test]
+    fn should_bound_read_overlap_in_mixed_workload_chunks() {
+        // Assert
+        assert_eq!(mixed_read_probe_count(4), 4);
+        assert_eq!(mixed_read_probe_count(128), 8);
+        assert_eq!(mixed_read_probe_count(256), 8);
+    }
+
+    #[test]
+    fn should_allow_cloud_maintenance_to_use_qualification_response_window() {
+        // Assert
+        assert_eq!(runtime_response_timeout("local"), Duration::from_secs(60));
+        assert_eq!(runtime_response_timeout("s3"), Duration::from_secs(180));
+    }
+
+    #[test]
+    fn should_leave_real_world_mixed_workloads_on_background_compaction() {
+        // Assert
+        assert!(!should_force_manual_compaction(
+            WorkloadKind::UuidCompaction
+        ));
+        assert!(!should_force_manual_compaction(
+            WorkloadKind::ColdCacheReadStorm
+        ));
+        assert!(should_force_manual_compaction(
+            WorkloadKind::DeleteSpaceAmplification
+        ));
     }
 }
