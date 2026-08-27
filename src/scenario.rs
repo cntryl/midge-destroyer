@@ -164,6 +164,41 @@ const SCENARIO_CATALOG: &[ScenarioDefinition] = &[
         smoke: false,
     },
     ScenarioDefinition {
+        name: "scan-compaction-starvation",
+        applicability: BackendApplicability::Any,
+        required_feature: None,
+        expected_behavior: FaultExpectation::TemporarilyUnavailable,
+        smoke: false,
+    },
+    ScenarioDefinition {
+        name: "snapshot-pinned-gc-pressure",
+        applicability: BackendApplicability::Any,
+        required_feature: None,
+        expected_behavior: FaultExpectation::SafetyPreserved,
+        smoke: false,
+    },
+    ScenarioDefinition {
+        name: "multi-cf-hot-cold-interference",
+        applicability: BackendApplicability::Any,
+        required_feature: None,
+        expected_behavior: FaultExpectation::TemporarilyUnavailable,
+        smoke: false,
+    },
+    ScenarioDefinition {
+        name: "delete-space-amplification",
+        applicability: BackendApplicability::Any,
+        required_feature: None,
+        expected_behavior: FaultExpectation::SafetyPreserved,
+        smoke: false,
+    },
+    ScenarioDefinition {
+        name: "cold-cache-read-storm",
+        applicability: BackendApplicability::CloudOnly,
+        required_feature: None,
+        expected_behavior: FaultExpectation::TemporarilyUnavailable,
+        smoke: false,
+    },
+    ScenarioDefinition {
         name: "ack-kill-window",
         applicability: BackendApplicability::Any,
         required_feature: None,
@@ -287,6 +322,32 @@ pub enum WorkloadLane {
     Trickle,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadKind {
+    #[default]
+    Pointwise,
+    UuidCompaction,
+    ScanCompaction,
+    SnapshotPinnedGc,
+    MultiCfHotCold,
+    DeleteSpaceAmplification,
+    ColdCacheReadStorm,
+}
+
+impl WorkloadKind {
+    fn from_scenario_name(name: &str) -> Option<Self> {
+        match name {
+            "scan-compaction-starvation" => Some(Self::ScanCompaction),
+            "snapshot-pinned-gc-pressure" => Some(Self::SnapshotPinnedGc),
+            "multi-cf-hot-cold-interference" => Some(Self::MultiCfHotCold),
+            "delete-space-amplification" => Some(Self::DeleteSpaceAmplification),
+            "cold-cache-read-storm" => Some(Self::ColdCacheReadStorm),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MutationOp {
     pub id: u64,
@@ -299,6 +360,14 @@ pub struct MutationOp {
     pub workload_lane: WorkloadLane,
     #[serde(default)]
     pub workload_batch: usize,
+    #[serde(default)]
+    pub workload_kind: WorkloadKind,
+    #[serde(default = "default_column_family")]
+    pub column_family: String,
+}
+
+fn default_column_family() -> String {
+    "default".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -335,6 +404,15 @@ impl Scenario {
                 faults: Vec::new(),
             };
         }
+        if let Some(kind) = WorkloadKind::from_scenario_name(name) {
+            return Self {
+                name: name.to_string(),
+                seed,
+                scale,
+                operations: adversarial_lsm_operations(seed, scale, kind),
+                faults: Vec::new(),
+            };
+        }
         let key_count = workload_key_count(scale);
         let mut ops = Vec::new();
         for i in 0..scale.ops() {
@@ -358,6 +436,8 @@ impl Scenario {
                 durable,
                 workload_lane: WorkloadLane::Pointwise,
                 workload_batch: 0,
+                workload_kind: WorkloadKind::Pointwise,
+                column_family: default_column_family(),
             });
         }
 
@@ -400,7 +480,12 @@ impl DeterministicPlan {
         let fault_count = scenario_fault_count(name, scale);
         let mut candidates: Vec<usize> = match name {
             "ack-kill-window" => final_durable_puts(&scenario.operations),
-            "uuid-compaction-pressure" => mixed_lsm_fault_boundaries(scale),
+            "uuid-compaction-pressure"
+            | "scan-compaction-starvation"
+            | "snapshot-pinned-gc-pressure"
+            | "multi-cf-hot-cold-interference"
+            | "delete-space-amplification"
+            | "cold-cache-read-storm" => mixed_lsm_fault_boundaries(scale),
             _ => (0..scenario.operations.len()).collect(),
         };
         candidates.shuffle(&mut rng);
@@ -521,9 +606,69 @@ fn mixed_lsm_operations(seed: u64, scale: RunScale) -> Vec<MutationOp> {
             durable,
             workload_lane,
             workload_batch,
+            workload_kind: WorkloadKind::UuidCompaction,
+            column_family: default_column_family(),
         });
     }
     operations
+}
+
+fn adversarial_lsm_operations(
+    seed: u64,
+    scale: RunScale,
+    workload_kind: WorkloadKind,
+) -> Vec<MutationOp> {
+    let operation_count = mixed_lsm_operation_count(scale);
+    let chunk_size = mixed_lsm_chunk_size(scale);
+    let key_count = chunk_size.saturating_mul(2).max(1);
+    (0..operation_count)
+        .map(|sequence| {
+            let workload_batch = sequence / chunk_size;
+            let slot = sequence % key_count;
+            let delete_frequency = if workload_kind == WorkloadKind::DeleteSpaceAmplification {
+                3
+            } else {
+                13
+            };
+            let action = if sequence >= key_count && sequence.is_multiple_of(delete_frequency) {
+                MutationAction::Delete
+            } else {
+                MutationAction::Put
+            };
+            let column_family = if workload_kind == WorkloadKind::MultiCfHotCold {
+                if sequence % 5 == 0 {
+                    "cold"
+                } else {
+                    "hot"
+                }
+            } else {
+                "default"
+            };
+            MutationOp {
+                id: seed.wrapping_mul(10_007).wrapping_add(sequence as u64),
+                sequence,
+                action: action.clone(),
+                key: format!("w{seed:016x}-{slot:08x}"),
+                value: (action == MutationAction::Put).then(|| {
+                    let size = if workload_kind == WorkloadKind::DeleteSpaceAmplification {
+                        8_192
+                    } else {
+                        1_024
+                    };
+                    format!("v{sequence:08x}-{}", "x".repeat(size))
+                }),
+                durable: !sequence.is_multiple_of(4),
+                workload_lane: if sequence % chunk_size < chunk_size.saturating_mul(3) / 4 {
+                    WorkloadLane::Batch
+                } else {
+                    WorkloadLane::Trickle
+                },
+                workload_batch,
+                workload_kind,
+                column_family: column_family.to_string(),
+            }
+        })
+        .collect()
 }
 
 fn deterministic_index(seed: u64, sequence: usize, len: usize) -> usize {
@@ -574,6 +719,11 @@ fn scenario_fault_count(name: &str, scale: RunScale) -> usize {
         "recovery-crash-loop"
             | "lease-takeover-latency"
             | "uuid-compaction-pressure"
+            | "scan-compaction-starvation"
+            | "snapshot-pinned-gc-pressure"
+            | "multi-cf-hot-cold-interference"
+            | "delete-space-amplification"
+            | "cold-cache-read-storm"
             | "ack-kill-window"
             | "cloud-cache-loss"
     ) || scenario_definition(name)
@@ -591,9 +741,13 @@ fn default_fault_count(scale: RunScale) -> usize {
 
 fn fault_catalog(name: &str) -> &'static [FaultClass] {
     match name {
-        "recovery-crash-loop" | "uuid-compaction-pressure" => {
-            &[FaultClass::ProcessKill, FaultClass::ForcedReopen]
-        }
+        "recovery-crash-loop"
+        | "uuid-compaction-pressure"
+        | "scan-compaction-starvation"
+        | "snapshot-pinned-gc-pressure"
+        | "multi-cf-hot-cold-interference"
+        | "delete-space-amplification" => &[FaultClass::ProcessKill, FaultClass::ForcedReopen],
+        "cold-cache-read-storm" => &[FaultClass::CloudCacheLoss, FaultClass::ProviderLatencySpike],
         "lease-takeover-latency" => &[
             FaultClass::ProcessKill,
             FaultClass::LeaseStalenessWindow,
@@ -832,6 +986,73 @@ mod tests {
         assert!(s3_names.contains(&"uuid-compaction-pressure"));
         assert!(s3_names.contains(&"cloud-cache-loss"));
         assert!(s3_names.contains(&"sqrzl-visibility"));
+        for name in [
+            "scan-compaction-starvation",
+            "snapshot-pinned-gc-pressure",
+            "multi-cf-hot-cold-interference",
+            "delete-space-amplification",
+        ] {
+            assert!(local_names.contains(&name), "local suite omitted {name}");
+            assert!(s3_names.contains(&name), "cloud suite omitted {name}");
+        }
+        assert!(!local_names.contains(&"cold-cache-read-storm"));
+        assert!(s3_names.contains(&"cold-cache-read-storm"));
+    }
+
+    #[test]
+    fn should_encode_distinct_production_workload_intent_for_new_scenarios() {
+        // Arrange
+        let cases = [
+            ("scan-compaction-starvation", WorkloadKind::ScanCompaction),
+            (
+                "snapshot-pinned-gc-pressure",
+                WorkloadKind::SnapshotPinnedGc,
+            ),
+            (
+                "multi-cf-hot-cold-interference",
+                WorkloadKind::MultiCfHotCold,
+            ),
+            (
+                "delete-space-amplification",
+                WorkloadKind::DeleteSpaceAmplification,
+            ),
+            ("cold-cache-read-storm", WorkloadKind::ColdCacheReadStorm),
+        ];
+
+        // Act and Assert
+        for (name, kind) in cases {
+            let scenario = Scenario::new(name, 17, RunScale::Small);
+            assert!(!scenario.operations.is_empty());
+            assert!(scenario
+                .operations
+                .iter()
+                .all(|operation| operation.workload_kind == kind));
+            assert!(scenario
+                .operations
+                .iter()
+                .any(|operation| operation.action == MutationAction::Delete));
+        }
+    }
+
+    #[test]
+    fn should_target_hot_and_cold_column_families_in_interference_workload() {
+        // Act
+        let scenario = Scenario::new("multi-cf-hot-cold-interference", 19, RunScale::Small);
+        let families = scenario
+            .operations
+            .iter()
+            .map(|operation| operation.column_family.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        // Assert
+        assert_eq!(families, std::collections::BTreeSet::from(["cold", "hot"]));
+        let hot = scenario
+            .operations
+            .iter()
+            .filter(|operation| operation.column_family == "hot")
+            .count();
+        let cold = scenario.operations.len().saturating_sub(hot);
+        assert!(hot >= cold.saturating_mul(3));
     }
 
     #[test]

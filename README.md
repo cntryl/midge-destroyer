@@ -19,9 +19,13 @@ Midge-specific adversarial correctness and recovery harness.
 - `destroyer frontier <scenario|all> --max-scale <small|medium|large|xlarge>`
 
 Executable black-box scenarios include `recovery-crash-loop`,
-`lease-takeover-latency`, `ack-kill-window`, `cloud-cache-loss`,
+`lease-takeover-latency`, `uuid-compaction-pressure`,
+`scan-compaction-starvation`, `snapshot-pinned-gc-pressure`,
+`multi-cf-hot-cold-interference`, `delete-space-amplification`,
+`cold-cache-read-storm`, `ack-kill-window`, `cloud-cache-loss`,
 `manifest-race`, `sst-corruption`, and `sqrzl-visibility`.
-`cloud-cache-loss` requires `s3`, `azure`, `gcs`, or another cloud backend.
+`cloud-cache-loss` and `cold-cache-read-storm` require `s3`, `azure`, `gcs`,
+or another cloud backend.
 
 Exact engine-cut scenarios require `--features failpoint-tier`:
 `wal-sync-ack-cut`, `manifest-sync-failure`, `compaction-commit-cut`,

@@ -1,8 +1,10 @@
 use clap::Parser;
 use cntryl_midge::{
-    CloudProviderConfig, CloudStorageLocation, OpenOptions, TransactionMode, WriteOptions,
+    CloudProviderConfig, CloudStorageLocation, ColumnFamilyHandle, OpenOptions, Query,
+    TransactionMode, WriteOptions,
 };
-use midge_destroyer::scenario::{MutationAction, WorkloadLane};
+use midge_destroyer::scenario::{MutationAction, WorkloadKind, WorkloadLane};
+use std::collections::BTreeMap;
 use std::fs::OpenOptions as FsOpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -20,6 +22,8 @@ enum WorkerCompletion {
     Interrupted,
     Incomplete,
 }
+
+type ScannedRows = Vec<(Vec<u8>, Vec<u8>)>;
 
 #[derive(Debug, Parser)]
 #[command(name = "midge-destroyer-worker", disable_help_subcommand = true)]
@@ -116,6 +120,14 @@ fn run_engine(
     report_file: &mut std::fs::File,
     args: &WorkerArgs,
 ) -> Result<WorkerCompletion, String> {
+    let verification_commands = args
+        .verify_commands
+        .as_ref()
+        .map(|path| {
+            let raw = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+            serde_json::from_str::<Vec<WorkerCommand>>(&raw).map_err(|error| error.to_string())
+        })
+        .transpose()?;
     let total_started = std::time::Instant::now();
     let options_started = std::time::Instant::now();
     let open_options = match args.cloud_provider.as_str() {
@@ -155,9 +167,17 @@ fn run_engine(
     let open_started = std::time::Instant::now();
     let mut engine = cntryl_midge::Engine::open(open_options).map_err(|error| error.to_string())?;
     let open_ms = open_started.elapsed().as_millis();
-    let cf = engine
+    let default_cf = engine
         .get_column_family("default")
         .ok_or_else(|| "default column family not found".to_string())?;
+    let mut column_families = BTreeMap::from([("default".to_string(), default_cf)]);
+    for name in required_column_family_names(commands, verification_commands.as_deref()) {
+        let handle = engine
+            .get_column_family(&name)
+            .map_or_else(|| engine.create_column_family(&name), Ok)
+            .map_err(|error| error.to_string())?;
+        column_families.insert(name, handle);
+    }
 
     let mutations_started = std::time::Instant::now();
     let mut first_mutation_ms = None;
@@ -228,11 +248,19 @@ fn run_engine(
 
         let operation_started = std::time::Instant::now();
         let (next_index, outcomes) = if mixed_chunk {
-            execute_mixed_chunk(&engine, &cf, commands, index, cloud, crash_during_chunk)?
+            execute_workload_chunk(
+                &engine,
+                &column_families,
+                commands,
+                index,
+                cloud,
+                crash_during_chunk,
+            )?
         } else {
+            let cf = column_family_for(&column_families, command)?;
             (
                 index.saturating_add(1),
-                vec![execute_command(&engine, &cf, command, cloud)],
+                vec![execute_command(&engine, cf, command, cloud)],
             )
         };
         if first_mutation_ms.is_none() {
@@ -286,11 +314,10 @@ fn run_engine(
 
     let mutations_ms = mutations_started.elapsed().as_millis();
     let verification_started = std::time::Instant::now();
-    if let Some(path) = &args.verify_commands {
-        let raw = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
-        let all_commands: Vec<WorkerCommand> =
-            serde_json::from_str(&raw).map_err(|error| error.to_string())?;
-        verify_final_state(&engine, &cf, &all_commands, report_file)?;
+    if let Some(all_commands) = &verification_commands {
+        verify_final_state(&engine, &column_families, all_commands, report_file)?;
+        validate_workload_invariants(&engine, all_commands)?;
+        write_workload_evidence(&engine, args, all_commands)?;
     }
     let verification_ms = verification_started.elapsed().as_millis();
 
@@ -315,6 +342,18 @@ fn run_engine(
     shutdown_result.map_err(|error| error.to_string())?;
 
     Ok(WorkerCompletion::Complete)
+}
+
+fn required_column_family_names(
+    commands: &[WorkerCommand],
+    verification_commands: Option<&[WorkerCommand]>,
+) -> std::collections::BTreeSet<String> {
+    commands
+        .iter()
+        .chain(verification_commands.into_iter().flatten())
+        .map(|command| command.column_family.clone())
+        .filter(|name| name != "default")
+        .collect()
 }
 
 fn graceful_shutdown_timeout(cloud_provider: &str) -> Duration {
@@ -386,7 +425,7 @@ fn env_or(name: &str, default: &str) -> String {
 
 fn verify_final_state(
     engine: &cntryl_midge::Engine,
-    cf: &cntryl_midge::ColumnFamilyHandle,
+    column_families: &BTreeMap<String, ColumnFamilyHandle>,
     commands: &[WorkerCommand],
     report_file: &mut std::fs::File,
 ) -> Result<(), String> {
@@ -398,22 +437,23 @@ fn verify_final_state(
             MutationAction::Delete => None,
             MutationAction::Noop => continue,
         };
-        expected.insert(command.key.clone(), value);
-        identities.insert(
-            command.key.clone(),
-            (command.operation_id, command.sequence),
-        );
+        let identity = (command.column_family.clone(), command.key.clone());
+        expected.insert(identity.clone(), value);
+        identities.insert(identity, (command.operation_id, command.sequence));
     }
-    let tx = engine
-        .begin_tx(cf.id(), TransactionMode::ReadOnly)
-        .map_err(|error| error.to_string())?;
-    for (key, expected_value) in expected {
+    for ((column_family, key), expected_value) in expected {
+        let cf = column_families
+            .get(&column_family)
+            .ok_or_else(|| format!("verification column family {column_family} is unavailable"))?;
+        let tx = engine
+            .begin_tx(cf.id(), TransactionMode::ReadOnly)
+            .map_err(|error| error.to_string())?;
         let actual = tx
             .get(key.as_bytes())
             .map_err(|error| error.to_string())?
             .map(|value| String::from_utf8_lossy(&value).into_owned());
         if actual != expected_value {
-            let (operation_id, sequence) = identities[&key];
+            let (operation_id, sequence) = identities[&(column_family.clone(), key.clone())];
             emit_error(
                 report_file,
                 ReportPhase::Verification,
@@ -428,7 +468,7 @@ fn verify_final_state(
             return Err(format!("recovery verification failed for key {key}"));
         }
         if expected_value.is_some() {
-            let (operation_id, sequence) = identities[&key];
+            let (operation_id, sequence) = identities[&(column_family.clone(), key.clone())];
             emit_error(
                 report_file,
                 ReportPhase::Verification,
@@ -480,6 +520,54 @@ fn emit_error(
     report_file.sync_all()
 }
 
+fn column_family_for<'a>(
+    column_families: &'a BTreeMap<String, ColumnFamilyHandle>,
+    command: &WorkerCommand,
+) -> Result<&'a ColumnFamilyHandle, String> {
+    column_families
+        .get(&command.column_family)
+        .ok_or_else(|| format!("column family {} is unavailable", command.column_family))
+}
+
+fn execute_workload_chunk(
+    engine: &cntryl_midge::Engine,
+    column_families: &BTreeMap<String, ColumnFamilyHandle>,
+    commands: &[WorkerCommand],
+    start: usize,
+    cloud: bool,
+    crash_during_chunk: bool,
+) -> Result<(usize, Vec<ObservedOutcome>), String> {
+    let kind = commands[start].workload_kind;
+    match kind {
+        WorkloadKind::SnapshotPinnedGc => execute_snapshot_pinned_chunk(
+            engine,
+            column_family_for(column_families, &commands[start])?,
+            commands,
+            start,
+            cloud,
+            crash_during_chunk,
+        ),
+        WorkloadKind::MultiCfHotCold => execute_multi_cf_chunk(
+            engine,
+            column_families,
+            commands,
+            start,
+            cloud,
+            crash_during_chunk,
+        ),
+        WorkloadKind::Pointwise => Err("pointwise command entered workload chunk".to_string()),
+        _ => execute_mixed_chunk(
+            engine,
+            column_family_for(column_families, &commands[start])?,
+            commands,
+            start,
+            cloud,
+            crash_during_chunk,
+            kind,
+        ),
+    }
+}
+
 fn execute_mixed_chunk(
     engine: &cntryl_midge::Engine,
     cf: &cntryl_midge::ColumnFamilyHandle,
@@ -487,6 +575,7 @@ fn execute_mixed_chunk(
     start: usize,
     cloud: bool,
     crash_during_chunk: bool,
+    workload_kind: WorkloadKind,
 ) -> Result<(usize, Vec<ObservedOutcome>), String> {
     let workload_batch = commands[start].workload_batch;
     let end = commands[start..]
@@ -535,12 +624,12 @@ fn execute_mixed_chunk(
         let read_barrier = Arc::clone(&barrier);
         let reader = scope.spawn(move || {
             read_barrier.wait();
-            exercise_read_pressure(engine, cf, &probe_keys, read_probe_count)
+            exercise_read_pressure(engine, cf, &probe_keys, read_probe_count, workload_kind)
         });
         let maintenance_barrier = Arc::clone(&barrier);
         let maintenance = scope.spawn(move || {
             maintenance_barrier.wait();
-            apply_lsm_maintenance(engine, cf, workload_batch)
+            apply_lsm_maintenance(engine, cf, workload_batch, workload_kind)
         });
         let crash = crash_during_chunk.then(|| {
             let crash_barrier = Arc::clone(&barrier);
@@ -574,6 +663,227 @@ fn execute_mixed_chunk(
     })?;
     outcomes.sort_by_key(outcome_sequence);
     Ok((end, outcomes))
+}
+
+fn workload_chunk_end(commands: &[WorkerCommand], start: usize) -> usize {
+    let workload_batch = commands[start].workload_batch;
+    commands[start..]
+        .iter()
+        .position(|command| command.workload_batch != workload_batch)
+        .map_or(commands.len(), |offset| start.saturating_add(offset))
+}
+
+fn execute_snapshot_pinned_chunk(
+    engine: &cntryl_midge::Engine,
+    cf: &ColumnFamilyHandle,
+    commands: &[WorkerCommand],
+    start: usize,
+    cloud: bool,
+    crash_during_chunk: bool,
+) -> Result<(usize, Vec<ObservedOutcome>), String> {
+    let end = workload_chunk_end(commands, start);
+    let chunk = commands[start..end].iter().collect::<Vec<_>>();
+    let snapshot = engine
+        .begin_tx(cf.id(), TransactionMode::ReadOnly)
+        .map_err(|error| error.to_string())?;
+    let pinned = engine
+        .get_runtime_metrics()
+        .map_err(|error| error.to_string())?
+        .active_snapshots;
+    if pinned == 0 {
+        return Err("snapshot workload did not register an active snapshot pin".to_string());
+    }
+    let before = collect_range_scan(&snapshot)?;
+    if crash_during_chunk {
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(2));
+            std::process::exit(1);
+        });
+    }
+    let outcomes = execute_batch_commands(engine, cf, &chunk, cloud);
+    engine.flush_cf(cf).map_err(|error| error.to_string())?;
+    engine.compact_all().map_err(|error| error.to_string())?;
+    let after = collect_range_scan(&snapshot)?;
+    if before != after {
+        return Err("snapshot changed while overwrite/delete compaction ran".to_string());
+    }
+    Ok((end, outcomes))
+}
+
+fn execute_multi_cf_chunk(
+    engine: &cntryl_midge::Engine,
+    column_families: &BTreeMap<String, ColumnFamilyHandle>,
+    commands: &[WorkerCommand],
+    start: usize,
+    cloud: bool,
+    crash_during_chunk: bool,
+) -> Result<(usize, Vec<ObservedOutcome>), String> {
+    let end = workload_chunk_end(commands, start);
+    let chunk = &commands[start..end];
+    let hot_cf = column_families
+        .get("hot")
+        .ok_or_else(|| "hot column family is unavailable".to_string())?;
+    let cold_cf = column_families
+        .get("cold")
+        .ok_or_else(|| "cold column family is unavailable".to_string())?;
+    let hot_commands = chunk
+        .iter()
+        .filter(|command| command.column_family == "hot")
+        .collect::<Vec<_>>();
+    let cold_commands = chunk
+        .iter()
+        .filter(|command| command.column_family == "cold")
+        .collect::<Vec<_>>();
+    let cold_keys = cold_commands
+        .iter()
+        .map(|command| command.key.clone())
+        .collect::<Vec<_>>();
+    let participants = if crash_during_chunk { 5 } else { 4 };
+    let barrier = Arc::new(Barrier::new(participants));
+    let mut outcomes = std::thread::scope(|scope| -> Result<Vec<ObservedOutcome>, String> {
+        let hot_barrier = Arc::clone(&barrier);
+        let hot = scope.spawn(move || {
+            hot_barrier.wait();
+            execute_batch_commands(engine, hot_cf, &hot_commands, cloud)
+        });
+        let cold_barrier = Arc::clone(&barrier);
+        let cold = scope.spawn(move || {
+            cold_barrier.wait();
+            execute_batch_commands(engine, cold_cf, &cold_commands, cloud)
+        });
+        let read_barrier = Arc::clone(&barrier);
+        let reads = scope.spawn(move || {
+            read_barrier.wait();
+            exercise_read_pressure(
+                engine,
+                cold_cf,
+                &cold_keys,
+                chunk.len().saturating_mul(16),
+                WorkloadKind::ScanCompaction,
+            )
+        });
+        let maintenance_barrier = Arc::clone(&barrier);
+        let maintenance = scope.spawn(move || {
+            maintenance_barrier.wait();
+            engine.flush_cf(hot_cf).map_err(|error| error.to_string())?;
+            engine
+                .flush_cf(cold_cf)
+                .map_err(|error| error.to_string())?;
+            engine.compact_all().map_err(|error| error.to_string())
+        });
+        let crash = crash_during_chunk.then(|| {
+            let crash_barrier = Arc::clone(&barrier);
+            scope.spawn(move || {
+                crash_barrier.wait();
+                std::thread::sleep(Duration::from_millis(2));
+                std::process::exit(1);
+            })
+        });
+        let mut outcomes = hot.join().map_err(|_| "hot CF lane panicked".to_string())?;
+        outcomes.extend(
+            cold.join()
+                .map_err(|_| "cold CF lane panicked".to_string())?,
+        );
+        reads
+            .join()
+            .map_err(|_| "cold read lane panicked".to_string())??;
+        maintenance
+            .join()
+            .map_err(|_| "multi-CF maintenance lane panicked".to_string())??;
+        if let Some(crash) = crash {
+            crash
+                .join()
+                .map_err(|_| "multi-CF crash lane panicked".to_string())?;
+        }
+        Ok(outcomes)
+    })?;
+    outcomes.sort_by_key(outcome_sequence);
+    Ok((end, outcomes))
+}
+
+fn collect_range_scan(tx: &cntryl_midge::Transaction) -> Result<ScannedRows, String> {
+    tx.scan(&Query::new())
+        .map_err(|error| error.to_string())?
+        .map(|row| {
+            row.map(|(key, value)| (key.to_vec(), value.to_vec()))
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
+fn validate_workload_invariants(
+    engine: &cntryl_midge::Engine,
+    commands: &[WorkerCommand],
+) -> Result<(), String> {
+    if commands.first().map(|command| command.workload_kind)
+        != Some(WorkloadKind::DeleteSpaceAmplification)
+    {
+        return Ok(());
+    }
+    let mut live = BTreeMap::new();
+    for command in commands {
+        live.insert(
+            (command.column_family.as_str(), command.key.as_str()),
+            command
+                .value
+                .as_ref()
+                .map_or(0_u64, |value| value.len() as u64),
+        );
+    }
+    let live_bytes = live.values().copied().sum::<u64>();
+    let metrics = engine
+        .get_runtime_metrics()
+        .map_err(|error| error.to_string())?;
+    let hard_bound = live_bytes.saturating_mul(8).saturating_add(1_048_576);
+    if metrics.sst_bytes > hard_bound {
+        return Err(format!(
+            "space amplification remained unbounded after compaction: sst_bytes={} live_bytes={} hard_bound={hard_bound}",
+            metrics.sst_bytes, live_bytes
+        ));
+    }
+    Ok(())
+}
+
+fn write_workload_evidence(
+    engine: &cntryl_midge::Engine,
+    args: &WorkerArgs,
+    commands: &[WorkerCommand],
+) -> Result<(), String> {
+    let Some(kind) = commands.first().map(|command| command.workload_kind) else {
+        return Ok(());
+    };
+    if kind == WorkloadKind::Pointwise {
+        return Ok(());
+    }
+    let runtime = engine
+        .get_runtime_metrics()
+        .map_err(|error| error.to_string())?;
+    let read_amplification = engine
+        .get_read_amp_metrics()
+        .map_err(|error| error.to_string())?;
+    let evidence = serde_json::json!({
+        "schema_version": "midge-destroyer.workload-evidence/v1",
+        "workload_kind": kind,
+        "runtime": runtime,
+        "read_amplification": {
+            "reads_total": read_amplification.reads_total,
+            "ssts_touched_total": read_amplification.ssts_touched_total,
+            "l0_ssts_touched_total": read_amplification.l0_ssts_touched_total,
+            "blocks_read_total": read_amplification.blocks_read_total,
+            "avg_ssts_per_read": read_amplification.avg_ssts_per_read,
+            "avg_l0_ssts_per_read": read_amplification.avg_l0_ssts_per_read,
+            "avg_blocks_per_read": read_amplification.avg_blocks_per_read,
+            "l0_overlap_rate": read_amplification.l0_overlap_rate,
+            "sst_budget_violation_rate": read_amplification.sst_budget_violation_rate,
+            "block_budget_violation_rate": read_amplification.block_budget_violation_rate,
+        },
+    });
+    let evidence_path = args.lifecycle_report.with_extension("workload.json");
+    std::fs::write(
+        evidence_path,
+        serde_json::to_vec_pretty(&evidence).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn execute_batch_commands(
@@ -612,6 +922,7 @@ fn exercise_read_pressure(
     cf: &cntryl_midge::ColumnFamilyHandle,
     keys: &[String],
     read_probe_count: usize,
+    workload_kind: WorkloadKind,
 ) -> Result<(), String> {
     for probe in 0..read_probe_count {
         let tx = engine
@@ -619,6 +930,18 @@ fn exercise_read_pressure(
             .map_err(|error| error.to_string())?;
         let key = &keys[probe % keys.len()];
         let _ = tx.get(key.as_bytes()).map_err(|error| error.to_string())?;
+        if matches!(
+            workload_kind,
+            WorkloadKind::ScanCompaction
+                | WorkloadKind::ColdCacheReadStorm
+                | WorkloadKind::DeleteSpaceAmplification
+        ) && probe.is_multiple_of(keys.len().max(1))
+        {
+            let rows = collect_range_scan(&tx)?;
+            if rows.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+                return Err("range scan returned non-increasing keys".to_string());
+            }
+        }
     }
     Ok(())
 }
@@ -627,12 +950,13 @@ fn apply_lsm_maintenance(
     engine: &cntryl_midge::Engine,
     cf: &cntryl_midge::ColumnFamilyHandle,
     workload_batch: usize,
+    workload_kind: WorkloadKind,
 ) -> Result<(), String> {
     if workload_batch == 0 {
         return Ok(());
     }
     engine.flush_cf(cf).map_err(|error| error.to_string())?;
-    if workload_batch.is_multiple_of(4) {
+    if workload_batch.is_multiple_of(4) || workload_kind == WorkloadKind::DeleteSpaceAmplification {
         engine.compact_all().map_err(|error| error.to_string())?;
     }
     Ok(())
@@ -720,5 +1044,46 @@ fn execute_command(
             key: command.key.clone(),
             error: error.to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::required_column_family_names;
+    use midge_destroyer::scenario::{MutationAction, WorkloadKind, WorkloadLane};
+    use midge_destroyer::worker_protocol::WorkerCommand;
+
+    fn command(column_family: &str) -> WorkerCommand {
+        WorkerCommand {
+            operation_id: 1,
+            sequence: 0,
+            action: MutationAction::Put,
+            key: "key".to_string(),
+            value: Some("value".to_string()),
+            durable: true,
+            workload_lane: WorkloadLane::Batch,
+            workload_batch: 0,
+            workload_kind: WorkloadKind::MultiCfHotCold,
+            column_family: column_family.to_string(),
+        }
+    }
+
+    #[test]
+    fn should_open_column_families_referenced_only_by_fresh_verifier() {
+        // Arrange
+        let mutation_commands = Vec::new();
+        let verification_commands = vec![command("hot"), command("cold")];
+
+        // Act
+        let names = required_column_family_names(
+            &mutation_commands,
+            Some(verification_commands.as_slice()),
+        );
+
+        // Assert
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from(["cold".to_string(), "hot".to_string()])
+        );
     }
 }

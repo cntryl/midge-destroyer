@@ -854,6 +854,8 @@ fn worker_command_from_op(operation: &MutationOp) -> WorkerCommand {
         durable: operation.durable,
         workload_lane: operation.workload_lane,
         workload_batch: operation.workload_batch,
+        workload_kind: operation.workload_kind,
+        column_family: operation.column_family.clone(),
     }
 }
 

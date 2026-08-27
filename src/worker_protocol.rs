@@ -1,4 +1,4 @@
-use crate::scenario::{MutationAction, WorkloadLane};
+use crate::scenario::{MutationAction, WorkloadKind, WorkloadLane};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +72,14 @@ pub struct WorkerCommand {
     pub workload_lane: WorkloadLane,
     #[serde(default)]
     pub workload_batch: usize,
+    #[serde(default)]
+    pub workload_kind: WorkloadKind,
+    #[serde(default = "default_column_family")]
+    pub column_family: String,
+}
+
+fn default_column_family() -> String {
+    "default".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,7 +127,8 @@ impl ObservedOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{OperationReport, WorkerLifecycleChannel};
+    use super::{OperationReport, WorkerCommand, WorkerLifecycleChannel};
+    use crate::scenario::{WorkloadKind, WorkloadLane};
 
     #[test]
     fn should_keep_lifecycle_errors_out_of_mutation_report_schema() {
@@ -132,5 +141,28 @@ mod tests {
 
         // Assert
         assert!(mutation.is_err());
+    }
+
+    #[test]
+    fn should_default_legacy_commands_to_pointwise_default_column_family() {
+        // Arrange
+        let raw = serde_json::json!({
+            "operation_id": 1,
+            "sequence": 0,
+            "action": "put",
+            "key": "key",
+            "value": "value",
+            "durable": true,
+            "workload_lane": "pointwise",
+            "workload_batch": 0
+        });
+
+        // Act
+        let command: WorkerCommand = serde_json::from_value(raw).expect("deserialize command");
+
+        // Assert
+        assert_eq!(command.workload_kind, WorkloadKind::Pointwise);
+        assert_eq!(command.workload_lane, WorkloadLane::Pointwise);
+        assert_eq!(command.column_family, "default");
     }
 }
