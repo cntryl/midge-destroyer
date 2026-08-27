@@ -114,6 +114,14 @@ fn main() {
     std::process::exit(0);
 }
 
+fn lease_durations(profile: &str) -> Result<(Duration, Duration), String> {
+    match profile {
+        "conservative" => Ok((Duration::from_secs(30), Duration::from_secs(15))),
+        "bounded-failover" => Ok((Duration::from_secs(10), Duration::from_secs(5))),
+        other => Err(format!("unsupported lease profile: {other}")),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_engine(
     commands: &[WorkerCommand],
@@ -152,11 +160,7 @@ fn run_engine(
         ),
         other => return Err(format!("unsupported cloud provider: {other}")),
     };
-    let (lease_ttl, lease_skew) = match args.lease_profile.as_str() {
-        "conservative" => (Duration::from_secs(30), Duration::from_secs(15)),
-        "bounded-failover" => (Duration::from_secs(30), Duration::from_secs(5)),
-        other => return Err(format!("unsupported lease profile: {other}")),
-    };
+    let (lease_ttl, lease_skew) = lease_durations(&args.lease_profile)?;
     let open_options = open_options
         .lease_ttl(lease_ttl)
         .lease_clock_skew_tolerance(lease_skew)
@@ -1049,7 +1053,7 @@ fn execute_command(
 
 #[cfg(test)]
 mod tests {
-    use super::required_column_family_names;
+    use super::{lease_durations, required_column_family_names};
     use midge_destroyer::scenario::{MutationAction, WorkloadKind, WorkloadLane};
     use midge_destroyer::worker_protocol::WorkerCommand;
 
@@ -1085,5 +1089,15 @@ mod tests {
             names,
             std::collections::BTreeSet::from(["cold".to_string(), "hot".to_string()])
         );
+    }
+
+    #[test]
+    fn should_match_bounded_failover_worker_lease_to_recovery_budget() {
+        // Act
+        let (ttl, skew) = lease_durations("bounded-failover").expect("bounded profile");
+
+        // Assert
+        assert_eq!(ttl.as_millis(), 10_000);
+        assert_eq!(skew.as_millis(), 5_000);
     }
 }

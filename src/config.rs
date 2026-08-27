@@ -13,7 +13,10 @@ pub enum LeaseProfile {
 impl LeaseProfile {
     #[must_use]
     pub fn ttl_ms(self) -> u64 {
-        30_000
+        match self {
+            Self::Conservative => 30_000,
+            Self::BoundedFailover => 10_000,
+        }
     }
 
     #[must_use]
@@ -206,8 +209,8 @@ mod tests {
         assert_eq!(
             budget,
             RecoveryBudget {
-                warning_threshold_ms: 32_000,
-                soft_deadline_ms: 40_000,
+                warning_threshold_ms: 16_000,
+                soft_deadline_ms: 20_000,
                 hard_deadline_ms: 120_000,
             }
         );
