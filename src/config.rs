@@ -20,6 +20,15 @@ impl LeaseProfile {
     }
 
     #[must_use]
+    pub fn ttl_ms_for_backend(self, backend: BackendKind) -> u64 {
+        if self == Self::BoundedFailover && backend != BackendKind::Local {
+            30_000
+        } else {
+            self.ttl_ms()
+        }
+    }
+
+    #[must_use]
     pub fn skew_ms(self) -> u64 {
         match self {
             Self::Conservative => 15_000,
@@ -37,10 +46,15 @@ impl LeaseProfile {
 
     #[must_use]
     pub fn recovery_budget(self, requested_hard_deadline_ms: u64) -> RecoveryBudget {
-        let soft_deadline_ms = self
-            .ttl_ms()
-            .saturating_add(self.skew_ms())
-            .saturating_add(5_000);
+        self.recovery_budget_with_ttl(requested_hard_deadline_ms, self.ttl_ms())
+    }
+
+    fn recovery_budget_with_ttl(
+        self,
+        requested_hard_deadline_ms: u64,
+        ttl_ms: u64,
+    ) -> RecoveryBudget {
+        let soft_deadline_ms = self.skew_ms().saturating_add(ttl_ms).saturating_add(5_000);
         RecoveryBudget {
             warning_threshold_ms: soft_deadline_ms.saturating_mul(80) / 100,
             soft_deadline_ms,
@@ -170,7 +184,10 @@ impl ScenarioConfig {
 
     #[must_use]
     pub fn recovery_budget(&self) -> RecoveryBudget {
-        self.lease_profile.recovery_budget(self.recovery_timeout_ms)
+        self.lease_profile.recovery_budget_with_ttl(
+            self.recovery_timeout_ms,
+            self.lease_profile.ttl_ms_for_backend(self.cloud),
+        )
     }
 }
 

@@ -114,10 +114,13 @@ fn main() {
     std::process::exit(0);
 }
 
-fn lease_durations(profile: &str) -> Result<(Duration, Duration), String> {
+fn lease_durations(profile: &str, cloud_provider: &str) -> Result<(Duration, Duration), String> {
     match profile {
         "conservative" => Ok((Duration::from_secs(30), Duration::from_secs(15))),
-        "bounded-failover" => Ok((Duration::from_secs(10), Duration::from_secs(5))),
+        "bounded-failover" if cloud_provider == "local" => {
+            Ok((Duration::from_secs(10), Duration::from_secs(5)))
+        }
+        "bounded-failover" => Ok((Duration::from_secs(30), Duration::from_secs(5))),
         other => Err(format!("unsupported lease profile: {other}")),
     }
 }
@@ -160,7 +163,7 @@ fn run_engine(
         ),
         other => return Err(format!("unsupported cloud provider: {other}")),
     };
-    let (lease_ttl, lease_skew) = lease_durations(&args.lease_profile)?;
+    let (lease_ttl, lease_skew) = lease_durations(&args.lease_profile, &args.cloud_provider)?;
     let open_options = open_options
         .lease_ttl(lease_ttl)
         .lease_clock_skew_tolerance(lease_skew)
@@ -1094,10 +1097,14 @@ mod tests {
     #[test]
     fn should_match_bounded_failover_worker_lease_to_recovery_budget() {
         // Act
-        let (ttl, skew) = lease_durations("bounded-failover").expect("bounded profile");
+        let (ttl, skew) = lease_durations("bounded-failover", "local").expect("bounded profile");
 
         // Assert
         assert_eq!(ttl.as_millis(), 10_000);
         assert_eq!(skew.as_millis(), 5_000);
+        let (cloud_ttl, cloud_skew) =
+            lease_durations("bounded-failover", "s3").expect("cloud bounded profile");
+        assert_eq!(cloud_ttl.as_millis(), 30_000);
+        assert_eq!(cloud_skew.as_millis(), 5_000);
     }
 }
