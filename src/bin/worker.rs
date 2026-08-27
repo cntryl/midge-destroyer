@@ -376,9 +376,11 @@ fn graceful_shutdown_timeout(cloud_provider: &str) -> Duration {
     if cloud_provider == "local" {
         Duration::from_secs(2)
     } else {
-        // Cloud WAL sealing has a 30-second minimum proof budget. Leave
-        // caller-side headroom for provider latency and lease fencing.
-        Duration::from_secs(45)
+        // Midge owns a 60-second cloud shutdown drain budget. The caller must
+        // wait beyond that budget so it receives the terminal durability
+        // result and lets fencing cleanup release the lease instead of
+        // exiting while the runtime still owns it.
+        Duration::from_secs(75)
     }
 }
 
@@ -761,6 +763,8 @@ fn execute_multi_cf_chunk(
         .iter()
         .map(|command| command.key.clone())
         .collect::<Vec<_>>();
+    let read_probe_count = mixed_read_probe_count(chunk.len());
+    let workload_batch = chunk[0].workload_batch;
     let participants = if crash_during_chunk { 5 } else { 4 };
     let barrier = Arc::new(Barrier::new(participants));
     let mut outcomes = std::thread::scope(|scope| -> Result<Vec<ObservedOutcome>, String> {
@@ -781,18 +785,20 @@ fn execute_multi_cf_chunk(
                 engine,
                 cold_cf,
                 &cold_keys,
-                chunk.len().saturating_mul(16),
+                read_probe_count,
                 WorkloadKind::ScanCompaction,
             )
         });
         let maintenance_barrier = Arc::clone(&barrier);
         let maintenance = scope.spawn(move || {
             maintenance_barrier.wait();
-            engine.flush_cf(hot_cf).map_err(|error| error.to_string())?;
-            engine
-                .flush_cf(cold_cf)
-                .map_err(|error| error.to_string())?;
-            engine.compact_all().map_err(|error| error.to_string())
+            apply_lsm_maintenance(engine, hot_cf, workload_batch, WorkloadKind::MultiCfHotCold)?;
+            apply_lsm_maintenance(
+                engine,
+                cold_cf,
+                workload_batch,
+                WorkloadKind::MultiCfHotCold,
+            )
         });
         let crash = crash_during_chunk.then(|| {
             let crash_barrier = Arc::clone(&barrier);
@@ -996,8 +1002,8 @@ fn apply_lsm_maintenance(
     Ok(())
 }
 
-fn should_force_manual_compaction(workload_kind: WorkloadKind) -> bool {
-    matches!(workload_kind, WorkloadKind::DeleteSpaceAmplification)
+fn should_force_manual_compaction(_workload_kind: WorkloadKind) -> bool {
+    false
 }
 
 fn failed_outcomes(commands: &[&WorkerCommand], error: &str) -> Vec<ObservedOutcome> {
@@ -1088,8 +1094,8 @@ fn execute_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        lease_durations, mixed_read_probe_count, required_column_family_names,
-        runtime_response_timeout, should_force_manual_compaction,
+        graceful_shutdown_timeout, lease_durations, mixed_read_probe_count,
+        required_column_family_names, runtime_response_timeout, should_force_manual_compaction,
     };
     use midge_destroyer::scenario::{MutationAction, WorkloadKind, WorkloadLane};
     use midge_destroyer::worker_protocol::WorkerCommand;
@@ -1159,6 +1165,13 @@ mod tests {
     }
 
     #[test]
+    fn should_leave_headroom_beyond_midge_cloud_shutdown_drain_budget() {
+        // Assert
+        assert_eq!(graceful_shutdown_timeout("local"), Duration::from_secs(2));
+        assert_eq!(graceful_shutdown_timeout("s3"), Duration::from_secs(75));
+    }
+
+    #[test]
     fn should_leave_real_world_mixed_workloads_on_background_compaction() {
         // Assert
         assert!(!should_force_manual_compaction(
@@ -1167,7 +1180,10 @@ mod tests {
         assert!(!should_force_manual_compaction(
             WorkloadKind::ColdCacheReadStorm
         ));
-        assert!(should_force_manual_compaction(
+        assert!(!should_force_manual_compaction(
+            WorkloadKind::MultiCfHotCold
+        ));
+        assert!(!should_force_manual_compaction(
             WorkloadKind::DeleteSpaceAmplification
         ));
     }

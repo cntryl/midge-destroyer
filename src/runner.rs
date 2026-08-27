@@ -397,7 +397,11 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
         std::fs::write(&verifier_commands, b"[]")?;
         let verifier_started = Instant::now();
         let verifier_deadline = pending_recovery.as_ref().map_or(
-            verifier_started + Duration::from_millis(budget.hard_deadline_ms),
+            verifier_started
+                + Duration::from_millis(fresh_verifier_budget_ms(
+                    cfg.config.max_runtime_ms,
+                    budget.hard_deadline_ms,
+                )),
             |pending| pending.started + Duration::from_millis(budget.hard_deadline_ms),
         );
         let mut attempt = 0_usize;
@@ -457,6 +461,7 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
         match verifier_status {
             WorkerStatus::Ok => recovery_verified = true,
             WorkerStatus::TimedOut => {
+                recovery_verified = false;
                 verification_incomplete = true;
                 notes.push("recovery verifier reached the hard observation deadline".to_string());
             }
@@ -464,6 +469,7 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
             | WorkerStatus::Incomplete
             | WorkerStatus::Crashed
             | WorkerStatus::Interrupted => {
+                recovery_verified = false;
                 verification_incomplete = true;
                 notes.push("recovery verifier failed before completing".to_string());
             }
@@ -528,6 +534,10 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
     };
     write_report(artifacts_dir.join("scenario-report.json"), &report)?;
     Ok(RunResult { report })
+}
+
+fn fresh_verifier_budget_ms(max_runtime_ms: u64, recovery_hard_deadline_ms: u64) -> u64 {
+    max_runtime_ms.max(recovery_hard_deadline_ms)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1348,6 +1358,13 @@ mod tests {
         let reports = read_report_lines(&path).expect("read complete report prefix");
 
         assert_eq!(reports.len(), 1);
+    }
+
+    #[test]
+    fn should_size_fresh_verifier_for_workload_and_recovery_budgets() {
+        // Assert
+        assert_eq!(fresh_verifier_budget_ms(300_000, 100_000), 300_000);
+        assert_eq!(fresh_verifier_budget_ms(45_000, 100_000), 100_000);
     }
 
     #[test]
