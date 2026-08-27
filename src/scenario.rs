@@ -644,6 +644,9 @@ fn adversarial_lsm_operations(
             } else {
                 "default"
             };
+            let batch_start = workload_batch.saturating_mul(chunk_size);
+            let batch_len = operation_count.saturating_sub(batch_start).min(chunk_size);
+            let batch_width = batch_len.saturating_mul(3).div_ceil(4);
             MutationOp {
                 id: seed.wrapping_mul(10_007).wrapping_add(sequence as u64),
                 sequence,
@@ -658,7 +661,7 @@ fn adversarial_lsm_operations(
                     format!("v{sequence:08x}-{}", "x".repeat(size))
                 }),
                 durable: !sequence.is_multiple_of(4),
-                workload_lane: if sequence % chunk_size < chunk_size.saturating_mul(3) / 4 {
+                workload_lane: if sequence % chunk_size < batch_width {
                     WorkloadLane::Batch
                 } else {
                     WorkloadLane::Trickle
@@ -1032,6 +1035,29 @@ mod tests {
                 .iter()
                 .any(|operation| operation.action == MutationAction::Delete));
         }
+    }
+
+    #[test]
+    fn should_keep_both_lanes_in_partial_adversarial_workload_batch() {
+        // Arrange
+        let scenario = Scenario::new("delete-space-amplification", 17, RunScale::XLarge);
+        let final_batch = scenario
+            .operations
+            .last()
+            .expect("scenario operation")
+            .workload_batch;
+
+        // Act
+        let lanes = scenario
+            .operations
+            .iter()
+            .filter(|operation| operation.workload_batch == final_batch)
+            .map(|operation| operation.workload_lane)
+            .collect::<Vec<_>>();
+
+        // Assert
+        assert!(lanes.contains(&WorkloadLane::Batch));
+        assert!(lanes.contains(&WorkloadLane::Trickle));
     }
 
     #[test]
