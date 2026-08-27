@@ -551,13 +551,15 @@ fn mixed_lsm_fault_boundaries(scale: RunScale) -> Vec<usize> {
 fn mixed_lsm_operations(seed: u64, scale: RunScale) -> Vec<MutationOp> {
     let operation_count = mixed_lsm_operation_count(scale);
     let chunk_size = mixed_lsm_chunk_size(scale);
-    let batch_width = chunk_size.saturating_mul(3) / 4;
     let mut batch_live = Vec::<String>::new();
     let mut trickle_live = Vec::<String>::new();
     let mut operations = Vec::with_capacity(operation_count);
 
     for sequence in 0..operation_count {
         let workload_batch = sequence / chunk_size;
+        let batch_start = workload_batch.saturating_mul(chunk_size);
+        let batch_len = operation_count.saturating_sub(batch_start).min(chunk_size);
+        let batch_width = batch_len.saturating_mul(3).div_ceil(4);
         let workload_lane = if sequence % chunk_size < batch_width {
             WorkloadLane::Batch
         } else {
@@ -1040,24 +1042,26 @@ mod tests {
     #[test]
     fn should_keep_both_lanes_in_partial_adversarial_workload_batch() {
         // Arrange
-        let scenario = Scenario::new("delete-space-amplification", 17, RunScale::XLarge);
-        let final_batch = scenario
-            .operations
-            .last()
-            .expect("scenario operation")
-            .workload_batch;
+        for name in ["delete-space-amplification", "uuid-compaction-pressure"] {
+            let scenario = Scenario::new(name, 17, RunScale::XLarge);
+            let final_batch = scenario
+                .operations
+                .last()
+                .expect("scenario operation")
+                .workload_batch;
 
-        // Act
-        let lanes = scenario
-            .operations
-            .iter()
-            .filter(|operation| operation.workload_batch == final_batch)
-            .map(|operation| operation.workload_lane)
-            .collect::<Vec<_>>();
+            // Act
+            let lanes = scenario
+                .operations
+                .iter()
+                .filter(|operation| operation.workload_batch == final_batch)
+                .map(|operation| operation.workload_lane)
+                .collect::<Vec<_>>();
 
-        // Assert
-        assert!(lanes.contains(&WorkloadLane::Batch));
-        assert!(lanes.contains(&WorkloadLane::Trickle));
+            // Assert
+            assert!(lanes.contains(&WorkloadLane::Batch), "scenario: {name}");
+            assert!(lanes.contains(&WorkloadLane::Trickle), "scenario: {name}");
+        }
     }
 
     #[test]
