@@ -30,6 +30,21 @@ pub struct WorkerLifecycleChannel {
     pub errors: Vec<LifecycleErrorReport>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerReadinessReport {
+    pub schema_version: String,
+    pub options_ms: u128,
+    pub open_ms: u128,
+    pub ready_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerProgressReport {
+    pub schema_version: String,
+    pub stage: String,
+    pub operation_index: usize,
+}
+
 impl WorkerLifecycleChannel {
     #[must_use]
     pub fn timing(lifecycle: LifecycleReport) -> Self {
@@ -127,7 +142,10 @@ impl ObservedOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{OperationReport, WorkerCommand, WorkerLifecycleChannel};
+    use super::{
+        OperationReport, WorkerCommand, WorkerLifecycleChannel, WorkerProgressReport,
+        WorkerReadinessReport,
+    };
     use crate::scenario::{WorkloadKind, WorkloadLane};
 
     #[test]
@@ -164,5 +182,42 @@ mod tests {
         assert_eq!(command.workload_kind, WorkloadKind::Pointwise);
         assert_eq!(command.workload_lane, WorkloadLane::Pointwise);
         assert_eq!(command.column_family, "default");
+    }
+
+    #[test]
+    fn should_round_trip_worker_readiness_report() {
+        // Arrange
+        let report = WorkerReadinessReport {
+            schema_version: "midge-destroyer.readiness/v1".to_string(),
+            options_ms: 2,
+            open_ms: 900,
+            ready_ms: 1_100,
+        };
+
+        // Act
+        let encoded = serde_json::to_vec(&report).expect("serialize readiness report");
+        let decoded: WorkerReadinessReport =
+            serde_json::from_slice(&encoded).expect("deserialize readiness report");
+
+        // Assert
+        assert_eq!(decoded, report);
+    }
+
+    #[test]
+    fn should_round_trip_worker_progress_report() {
+        // Arrange
+        let report = WorkerProgressReport {
+            schema_version: "midge-destroyer.progress/v1".to_string(),
+            stage: "snapshot-compaction-complete".to_string(),
+            operation_index: 256,
+        };
+
+        // Act
+        let encoded = serde_json::to_vec(&report).expect("serialize progress report");
+        let decoded: WorkerProgressReport =
+            serde_json::from_slice(&encoded).expect("deserialize progress report");
+
+        // Assert
+        assert_eq!(decoded, report);
     }
 }

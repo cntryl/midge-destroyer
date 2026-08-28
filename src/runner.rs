@@ -11,7 +11,9 @@ use crate::scenario::{
     MutationOp, ScenarioAvailability, ScenarioDefinition,
 };
 use crate::types::BackendKind;
-use crate::worker_protocol::{OperationReport, WorkerCommand, WorkerLifecycleChannel};
+use crate::worker_protocol::{
+    OperationReport, WorkerCommand, WorkerLifecycleChannel, WorkerReadinessReport,
+};
 use anyhow::{Context, Result};
 use rand::prelude::IndexedRandom;
 use rand::rngs::SmallRng;
@@ -65,6 +67,21 @@ struct PendingRecovery {
     step: usize,
     started: Instant,
     attempts: usize,
+    readiness: Option<RecoveryReadiness>,
+}
+
+struct RecoveryReadiness {
+    contention_duration_ms: u128,
+    recovery_latency_ms: u128,
+}
+
+struct ObservedWorkerReadiness {
+    observed_at: Instant,
+}
+
+struct WorkerRunResult {
+    status: WorkerStatus,
+    readiness: Option<ObservedWorkerReadiness>,
 }
 
 /// Run one scenario with an execution-scoped emulator when required.
@@ -154,7 +171,9 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
 
     let plan = DeterministicPlan::from_seed(&cfg.scenario, cfg.config.seed, cfg.config.scale);
     let budget = cfg.config.recovery_budget();
-    let effective_max_runtime_ms = cfg.config.max_runtime_ms.saturating_add(
+    let workload_runtime_ms =
+        workload_runtime_budget_ms(&plan.scenario, cfg.config.cloud, cfg.config.max_runtime_ms);
+    let effective_max_runtime_ms = workload_runtime_ms.saturating_add(
         (plan.scenario.faults.len() as u64).saturating_mul(budget.hard_deadline_ms),
     );
     let scenario_deadline = started_clock + Duration::from_millis(effective_max_runtime_ms);
@@ -243,10 +262,13 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
                 "segment-{segment_index}-attempt-{attempt}-lifecycle.json"
             ));
             let attempt_started = Instant::now();
+            let readiness_deadline = pending_recovery
+                .as_ref()
+                .map(|pending| pending.started + Duration::from_millis(budget.hard_deadline_ms));
             if let Some(pending) = pending_recovery.as_mut() {
                 pending.attempts = pending.attempts.saturating_add(1);
             }
-            let status = run_worker(
+            let worker_run = run_worker(
                 &metadata,
                 hard_crash.then_some(fault_at.unwrap_or_default()),
                 crash_after_ack.then_some(fault_at.unwrap_or_default()),
@@ -260,9 +282,21 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
                 &command_path,
                 &lifecycle_path,
                 scenario_deadline,
+                readiness_deadline,
             )?;
+            let status = worker_run.status;
             let reports = read_report_lines(&report_path)?;
             let channel = read_lifecycle_channel(&lifecycle_path);
+            if worker_requires_acquisition_lock_cleanup(status)
+                && clear_terminated_worker_acquisition_lock(&db_path)?
+            {
+                notes.push("cleared a controller-terminated worker acquisition lock".to_string());
+            }
+            record_ready_recovery(
+                &mut pending_recovery,
+                attempt_started,
+                worker_run.readiness.as_ref(),
+            );
             let lease_held = channel.as_ref().is_some_and(channel_reports_lease_held);
             if lease_held {
                 if let Some(pending) = pending_recovery.as_ref() {
@@ -278,36 +312,16 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
                         continue;
                     }
                 }
-            } else if matches!(
-                status,
-                WorkerStatus::Ok | WorkerStatus::Interrupted | WorkerStatus::Crashed
-            ) {
-                if let Some(pending) = pending_recovery.take() {
-                    let open_ms = channel
-                        .as_ref()
-                        .and_then(|entry| entry.lifecycle.as_ref())
-                        .map_or(0, |lifecycle| lifecycle.open_ms);
-                    let recovery_latency_ms = attempt_started
-                        .duration_since(pending.started)
-                        .as_millis()
-                        .saturating_add(open_ms);
-                    recovery_events.push(RecoveryEvent::recovered(
-                        pending.fault_class,
-                        pending.step,
-                        pending.attempts,
-                        attempt_started.duration_since(pending.started).as_millis(),
-                        recovery_latency_ms,
-                        budget,
-                    ));
-                }
             }
             break (status, reports);
         };
-        let next_start_after_reports = next_worker_start(start, &reports);
+        let next_start_after_reports =
+            next_worker_start(start, &reports, &plan.scenario.operations);
         observed.append(&mut reports);
 
         match status {
             WorkerStatus::Crashed | WorkerStatus::Interrupted => {
+                complete_ready_recovery(&mut pending_recovery, budget, &mut recovery_events);
                 recovery_verification_needed = true;
                 let Some(fault) = next_fault else {
                     notes.push("worker stopped without an expected fault trigger".to_string());
@@ -323,14 +337,8 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
                     step: fault.step,
                     started: Instant::now(),
                     attempts: 0,
+                    readiness: None,
                 });
-                if status == WorkerStatus::Crashed {
-                    clear_terminated_worker_acquisition_lock(&db_path)?;
-                    notes.push(
-                        "cleared the terminated worker's acquisition lock after crash proof"
-                            .to_string(),
-                    );
-                }
                 if let Err(error) = apply_fault(&db_path, &fault) {
                     notes.push(format!("fault {:?} was not applied: {error}", fault.class));
                     recovery_events.push(RecoveryEvent {
@@ -354,20 +362,18 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
                 faults.retain(|entry| entry.step != fault.step);
             }
             WorkerStatus::Ok => {
+                complete_ready_recovery(&mut pending_recovery, budget, &mut recovery_events);
                 start = plan.scenario.operations.len();
                 recovery_verified = true;
             }
             WorkerStatus::Failed | WorkerStatus::Incomplete if pending_recovery.is_some() => {
-                clear_terminated_worker_acquisition_lock(&db_path)?;
-                notes.push(
-                    "cleared the terminated fault worker's acquisition lock before recovery"
-                        .to_string(),
-                );
                 recovery_verification_needed = true;
+                reset_unstable_recovery_readiness(&mut pending_recovery);
                 if pending_recovery.as_ref().is_some_and(|pending| {
                     pending.started.elapsed() >= Duration::from_millis(budget.hard_deadline_ms)
                 }) {
                     verification_incomplete = true;
+                    execution_incomplete = true;
                     break;
                 }
                 start = next_start_after_reports;
@@ -381,12 +387,40 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
                 execution_incomplete = true;
                 break;
             }
-            WorkerStatus::TimedOut => {
+            WorkerStatus::TimedOut(timeout)
+                if can_retry_pending_recovery(
+                    pending_recovery.as_ref(),
+                    Instant::now(),
+                    scenario_deadline,
+                    budget.hard_deadline_ms,
+                ) =>
+            {
+                recovery_verification_needed = true;
+                reset_unstable_recovery_readiness(&mut pending_recovery);
+                notes.push(format!(
+                    "ready recovery worker became unstable ({timeout:?}); retrying before the hard deadline"
+                ));
+                start = next_start_after_reports;
+                if start >= plan.scenario.operations.len() {
+                    break;
+                }
+                segment_index = segment_index.saturating_add(1);
+            }
+            WorkerStatus::TimedOut(timeout) => {
+                reset_unstable_recovery_readiness(&mut pending_recovery);
                 timed_out = true;
                 execution_incomplete = true;
-                notes.push(format!(
-                    "scenario exceeded its {effective_max_runtime_ms} ms observation deadline"
-                ));
+                notes.push(match timeout {
+                    WorkerTimeout::ObservationDeadline => format!(
+                        "scenario exceeded its {effective_max_runtime_ms} ms observation deadline"
+                    ),
+                    WorkerTimeout::NoProgress => {
+                        "worker exceeded its bounded no-progress deadline".to_string()
+                    }
+                    WorkerTimeout::RecoveryDeadline => {
+                        "worker did not become ready by the recovery hard deadline".to_string()
+                    }
+                });
                 break;
             }
         }
@@ -395,11 +429,19 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
     if recovery_verification_needed {
         let verifier_commands = segment_dir.join("recovery-verifier-commands.json");
         std::fs::write(&verifier_commands, b"[]")?;
+        let verifier_expectations = if execution_incomplete {
+            let path = segment_dir.join("recovery-verifier-acknowledged-state.json");
+            let commands = acknowledged_final_state_commands(&plan.scenario.operations, &observed);
+            std::fs::write(&path, serde_json::to_vec_pretty(&commands)?)?;
+            path
+        } else {
+            command_path.clone()
+        };
         let verifier_started = Instant::now();
         let verifier_deadline = pending_recovery.as_ref().map_or(
             verifier_started
                 + Duration::from_millis(fresh_verifier_budget_ms(
-                    cfg.config.max_runtime_ms,
+                    workload_runtime_ms,
                     budget.hard_deadline_ms,
                 )),
             |pending| pending.started + Duration::from_millis(budget.hard_deadline_ms),
@@ -412,10 +454,13 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
                 "recovery-verifier-attempt-{attempt}-lifecycle.json"
             ));
             let attempt_started = Instant::now();
+            let readiness_deadline = pending_recovery
+                .as_ref()
+                .map(|pending| pending.started + Duration::from_millis(budget.hard_deadline_ms));
             if let Some(pending) = pending_recovery.as_mut() {
                 pending.attempts = pending.attempts.saturating_add(1);
             }
-            let status = run_worker(
+            let worker_run = run_worker(
                 &metadata,
                 None,
                 None,
@@ -423,12 +468,24 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
                 &db_path,
                 &verifier_commands,
                 &report_path,
-                &command_path,
+                &verifier_expectations,
                 &lifecycle_path,
                 verifier_deadline,
+                readiness_deadline,
             )?;
+            let status = worker_run.status;
             let mut reports = read_report_lines(&report_path)?;
             let channel = read_lifecycle_channel(&lifecycle_path);
+            if worker_requires_acquisition_lock_cleanup(status)
+                && clear_terminated_worker_acquisition_lock(&db_path)?
+            {
+                notes.push("cleared a controller-terminated verifier acquisition lock".to_string());
+            }
+            record_ready_recovery(
+                &mut pending_recovery,
+                attempt_started,
+                worker_run.readiness.as_ref(),
+            );
             let lease_held = channel.as_ref().is_some_and(channel_reports_lease_held);
             if lease_held && Instant::now() < verifier_deadline {
                 attempt = attempt.saturating_add(1);
@@ -436,31 +493,16 @@ pub fn run_scenario_at(root: PathBuf, cfg: ParsedRunConfig) -> Result<RunResult>
                 continue;
             }
             if !lease_held && status == WorkerStatus::Ok {
-                if let Some(pending) = pending_recovery.take() {
-                    let open_ms = channel
-                        .as_ref()
-                        .and_then(|entry| entry.lifecycle.as_ref())
-                        .map_or(0, |lifecycle| lifecycle.open_ms);
-                    let recovery_latency_ms = attempt_started
-                        .duration_since(pending.started)
-                        .as_millis()
-                        .saturating_add(open_ms);
-                    recovery_events.push(RecoveryEvent::recovered(
-                        pending.fault_class,
-                        pending.step,
-                        pending.attempts,
-                        attempt_started.duration_since(pending.started).as_millis(),
-                        recovery_latency_ms,
-                        budget,
-                    ));
-                }
+                complete_ready_recovery(&mut pending_recovery, budget, &mut recovery_events);
+            } else if !lease_held {
+                reset_unstable_recovery_readiness(&mut pending_recovery);
             }
             observed.append(&mut reports);
             break status;
         };
         match verifier_status {
             WorkerStatus::Ok => recovery_verified = true,
-            WorkerStatus::TimedOut => {
+            WorkerStatus::TimedOut(_) => {
                 recovery_verified = false;
                 verification_incomplete = true;
                 notes.push("recovery verifier reached the hard observation deadline".to_string());
@@ -540,14 +582,112 @@ fn fresh_verifier_budget_ms(max_runtime_ms: u64, recovery_hard_deadline_ms: u64)
     max_runtime_ms.max(recovery_hard_deadline_ms)
 }
 
-#[derive(Debug, PartialEq, Eq)]
+fn workload_runtime_budget_ms(
+    scenario: &crate::scenario::Scenario,
+    backend: BackendKind,
+    configured_ms: u64,
+) -> u64 {
+    const CLOUD_BATCH_BUDGET_MS: u64 = 30_000;
+
+    if scenario.name != "snapshot-pinned-gc-pressure" || !backend.is_cloud() {
+        return configured_ms;
+    }
+
+    // Every snapshot-pressure batch flushes and compacts while retaining an
+    // older generation. Budget each independently so larger scales do not get
+    // less observation time per increasingly expensive compaction frontier.
+    let batch_count = scenario
+        .operations
+        .last()
+        .map_or(0, |operation| operation.workload_batch.saturating_add(1));
+    configured_ms.max(
+        u64::try_from(batch_count)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(CLOUD_BATCH_BUDGET_MS),
+    )
+}
+
+fn record_ready_recovery(
+    pending: &mut Option<PendingRecovery>,
+    attempt_started: Instant,
+    readiness: Option<&ObservedWorkerReadiness>,
+) {
+    let (Some(pending_recovery), Some(readiness)) = (pending.as_mut(), readiness) else {
+        return;
+    };
+    if pending_recovery.readiness.is_some() {
+        return;
+    }
+    let contention_duration_ms = attempt_started
+        .duration_since(pending_recovery.started)
+        .as_millis();
+    let recovery_latency_ms = readiness
+        .observed_at
+        .duration_since(pending_recovery.started)
+        .as_millis();
+    pending_recovery.readiness = Some(RecoveryReadiness {
+        contention_duration_ms,
+        recovery_latency_ms,
+    });
+}
+
+fn complete_ready_recovery(
+    pending: &mut Option<PendingRecovery>,
+    budget: crate::config::RecoveryBudget,
+    events: &mut Vec<RecoveryEvent>,
+) {
+    let Some(readiness) = pending
+        .as_ref()
+        .and_then(|pending_recovery| pending_recovery.readiness.as_ref())
+    else {
+        return;
+    };
+    let contention_duration_ms = readiness.contention_duration_ms;
+    let recovery_latency_ms = readiness.recovery_latency_ms;
+    let pending_recovery = pending.take().expect("pending recovery was present");
+    events.push(RecoveryEvent::recovered(
+        pending_recovery.fault_class,
+        pending_recovery.step,
+        pending_recovery.attempts,
+        contention_duration_ms,
+        recovery_latency_ms,
+        budget,
+    ));
+}
+
+fn reset_unstable_recovery_readiness(pending: &mut Option<PendingRecovery>) {
+    if let Some(pending_recovery) = pending.as_mut() {
+        pending_recovery.readiness = None;
+    }
+}
+
+fn can_retry_pending_recovery(
+    pending: Option<&PendingRecovery>,
+    observed_at: Instant,
+    scenario_deadline: Instant,
+    hard_deadline_ms: u64,
+) -> bool {
+    pending.is_some_and(|pending_recovery| {
+        observed_at < scenario_deadline
+            && observed_at < pending_recovery.started + Duration::from_millis(hard_deadline_ms)
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerStatus {
     Ok,
     Failed,
     Incomplete,
     Crashed,
     Interrupted,
-    TimedOut,
+    TimedOut(WorkerTimeout),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerTimeout {
+    ObservationDeadline,
+    NoProgress,
+    RecoveryDeadline,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -562,7 +702,8 @@ fn run_worker(
     verify_commands: &Path,
     lifecycle_report: &Path,
     deadline: Instant,
-) -> Result<WorkerStatus> {
+    readiness_deadline: Option<Instant>,
+) -> Result<WorkerRunResult> {
     let executable = std::env::current_exe().context("locate current executable")?;
     let worker = executable.parent().map_or_else(
         || PathBuf::from(WORKER_BINARY),
@@ -592,54 +733,197 @@ fn run_worker(
         .stderr(Stdio::from(worker_error_log))
         .spawn()
         .context("spawn worker")?;
+    let readiness_path = readiness_path_for(lifecycle_report);
+    let progress_path = progress_path_for(lifecycle_report);
+    let no_progress_timeout = worker_no_progress_timeout(metadata.cloud);
+    let mut readiness = None;
+    let mut last_report_len = report_file.metadata().map_or(0, |metadata| metadata.len());
+    let mut last_progress_len = progress_path
+        .metadata()
+        .map_or(0, |metadata| metadata.len());
+    let mut last_progress = Instant::now();
     let status = loop {
+        if readiness.is_none() && read_readiness_report(&readiness_path).is_some() {
+            readiness = Some(ObservedWorkerReadiness {
+                observed_at: Instant::now(),
+            });
+            last_progress = Instant::now();
+        }
+        if observe_file_growth(report_file, &mut last_report_len)
+            || observe_file_growth(&progress_path, &mut last_progress_len)
+        {
+            last_progress = Instant::now();
+        }
         if let Some(status) = child.try_wait().context("poll worker")? {
             break status;
         }
-        if Instant::now() >= deadline {
+        let observed_at = Instant::now();
+        if worker_exceeded_recovery_deadline(observed_at, readiness.is_some(), readiness_deadline) {
             let _ = child.kill();
             let _ = child.wait();
-            return Ok(WorkerStatus::TimedOut);
+            return Ok(WorkerRunResult {
+                status: WorkerStatus::TimedOut(WorkerTimeout::RecoveryDeadline),
+                readiness,
+            });
+        }
+        if observed_at >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(WorkerRunResult {
+                status: WorkerStatus::TimedOut(WorkerTimeout::ObservationDeadline),
+                readiness,
+            });
+        }
+        if worker_exceeded_no_progress(observed_at, last_progress, no_progress_timeout) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(WorkerRunResult {
+                status: WorkerStatus::TimedOut(WorkerTimeout::NoProgress),
+                readiness,
+            });
         }
         std::thread::sleep(Duration::from_millis(25));
     };
-    if status.success() {
-        Ok(WorkerStatus::Ok)
+    if readiness.is_none() {
+        readiness = read_readiness_report(&readiness_path).map(|_| ObservedWorkerReadiness {
+            observed_at: Instant::now(),
+        });
+    }
+    let status = if status.success() {
+        WorkerStatus::Ok
     } else if status.code() == Some(1) {
-        Ok(WorkerStatus::Crashed)
+        WorkerStatus::Crashed
     } else if status.code() == Some(3) {
-        Ok(WorkerStatus::Interrupted)
+        WorkerStatus::Interrupted
     } else if status.code() == Some(4) {
-        Ok(WorkerStatus::Incomplete)
+        WorkerStatus::Incomplete
     } else {
-        Ok(WorkerStatus::Failed)
+        WorkerStatus::Failed
+    };
+    Ok(WorkerRunResult { status, readiness })
+}
+
+fn readiness_path_for(lifecycle_report: &Path) -> PathBuf {
+    worker_artifact_path(lifecycle_report, "readiness")
+}
+
+fn progress_path_for(lifecycle_report: &Path) -> PathBuf {
+    worker_artifact_path(lifecycle_report, "progress")
+}
+
+fn worker_artifact_path(lifecycle_report: &Path, artifact: &str) -> PathBuf {
+    let Some(file_name) = lifecycle_report.file_name().and_then(|name| name.to_str()) else {
+        return lifecycle_report.with_extension(format!("{artifact}.json"));
+    };
+    let Some(prefix) = file_name.strip_suffix("-lifecycle.json") else {
+        return lifecycle_report.with_extension(format!("{artifact}.json"));
+    };
+    lifecycle_report.with_file_name(format!("{prefix}-{artifact}.json"))
+}
+
+fn read_readiness_report(path: &Path) -> Option<WorkerReadinessReport> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+}
+
+fn worker_no_progress_timeout(backend: BackendKind) -> Duration {
+    if backend.is_cloud() {
+        // Midge cloud requests own a 180-second response budget. A small
+        // observer margin lets that request return its attributable error
+        // while still bounding a worker that emits no readiness or reports.
+        Duration::from_secs(195)
+    } else {
+        Duration::from_secs(75)
     }
 }
 
-fn next_worker_start(current_start: usize, reports: &[OperationReport]) -> usize {
-    let mut next = current_start;
-    for report in reports
+fn worker_exceeded_no_progress(
+    observed_at: Instant,
+    last_progress: Instant,
+    timeout: Duration,
+) -> bool {
+    observed_at.duration_since(last_progress) >= timeout
+}
+
+fn worker_exceeded_recovery_deadline(
+    observed_at: Instant,
+    ready: bool,
+    deadline: Option<Instant>,
+) -> bool {
+    !ready && deadline.is_some_and(|deadline| observed_at >= deadline)
+}
+
+fn observe_file_growth(path: &Path, previous_len: &mut u64) -> bool {
+    let observed_len = path
+        .metadata()
+        .map_or(*previous_len, |metadata| metadata.len());
+    if observed_len <= *previous_len {
+        return false;
+    }
+    *previous_len = observed_len;
+    true
+}
+
+fn next_worker_start(
+    current_start: usize,
+    reports: &[OperationReport],
+    operations: &[MutationOp],
+) -> usize {
+    let mutation_reports = reports
         .iter()
         .filter(|report| report.phase == crate::worker_protocol::ReportPhase::Mutation)
-    {
-        match report.outcome {
-            crate::worker_protocol::ObservedOutcome::Acked { .. } => {
-                next = next.max(report.sequence.saturating_add(1));
-            }
-            crate::worker_protocol::ObservedOutcome::Failed { .. }
-            | crate::worker_protocol::ObservedOutcome::Unknown { .. } => {
-                return report.sequence;
-            }
+        .collect::<Vec<_>>();
+    let failed_sequence = mutation_reports
+        .iter()
+        .filter(|report| {
+            matches!(
+                report.outcome,
+                crate::worker_protocol::ObservedOutcome::Failed { .. }
+                    | crate::worker_protocol::ObservedOutcome::Unknown { .. }
+            )
+        })
+        .map(|report| report.sequence)
+        .min();
+    if let Some(failed_sequence) = failed_sequence {
+        let Some(failed_operation) = operations
+            .iter()
+            .find(|operation| operation.sequence == failed_sequence)
+        else {
+            return failed_sequence;
+        };
+        if failed_operation.workload_kind == crate::scenario::WorkloadKind::Pointwise {
+            return failed_sequence;
         }
+        return operations
+            .iter()
+            .find(|operation| {
+                operation.workload_kind == failed_operation.workload_kind
+                    && operation.workload_batch == failed_operation.workload_batch
+            })
+            .map_or(failed_sequence, |operation| operation.sequence);
     }
-    next
+
+    mutation_reports.iter().fold(current_start, |next, report| {
+        next.max(report.sequence.saturating_add(1))
+    })
 }
 
-fn clear_terminated_worker_acquisition_lock(db_path: &Path) -> Result<()> {
+fn worker_requires_acquisition_lock_cleanup(status: WorkerStatus) -> bool {
+    matches!(
+        status,
+        WorkerStatus::Crashed
+            | WorkerStatus::Failed
+            | WorkerStatus::Incomplete
+            | WorkerStatus::TimedOut(_)
+    )
+}
+
+fn clear_terminated_worker_acquisition_lock(db_path: &Path) -> Result<bool> {
     let lock_path = db_path.join(".midge_leader.lock");
     match std::fs::remove_file(&lock_path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error)
             .with_context(|| format!("clear terminated worker lock {}", lock_path.display())),
     }
@@ -670,6 +954,10 @@ fn build_worker_command(
         .arg(verify_commands)
         .arg("--lifecycle-report")
         .arg(lifecycle_report)
+        .arg("--readiness-report")
+        .arg(readiness_path_for(lifecycle_report))
+        .arg("--progress-report")
+        .arg(progress_path_for(lifecycle_report))
         .arg("--cloud-provider")
         .arg(metadata.cloud.as_arg())
         .arg("--cloud-prefix")
@@ -726,8 +1014,10 @@ fn read_lifecycle_channels(directory: &Path) -> Vec<WorkerLifecycleChannel> {
     let mut paths = entries
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| {
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().contains("lifecycle"))
+            path.file_name().is_some_and(|name| {
+                name.to_str()
+                    .is_some_and(|name| name.ends_with("-lifecycle.json"))
+            })
         })
         .collect::<Vec<_>>();
     paths.sort();
@@ -873,6 +1163,60 @@ fn worker_command_from_op(operation: &MutationOp) -> WorkerCommand {
         workload_kind: operation.workload_kind,
         column_family: operation.column_family.clone(),
     }
+}
+
+fn acknowledged_final_state_commands(
+    operations: &[MutationOp],
+    reports: &[OperationReport],
+) -> Vec<WorkerCommand> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum MutationCertainty {
+        Acked,
+        Failed,
+        Unknown,
+    }
+
+    let mut reported = std::collections::HashMap::new();
+    for report in reports
+        .iter()
+        .filter(|report| report.phase == crate::worker_protocol::ReportPhase::Mutation)
+    {
+        let certainty = reported
+            .entry(report.operation_id)
+            .or_insert(MutationCertainty::Failed);
+        match report.outcome {
+            crate::worker_protocol::ObservedOutcome::Acked { .. } => {
+                *certainty = MutationCertainty::Acked;
+            }
+            crate::worker_protocol::ObservedOutcome::Unknown { .. }
+                if *certainty != MutationCertainty::Acked =>
+            {
+                *certainty = MutationCertainty::Unknown;
+            }
+            crate::worker_protocol::ObservedOutcome::Failed { .. }
+            | crate::worker_protocol::ObservedOutcome::Unknown { .. } => {}
+        }
+    }
+
+    let mut acknowledged_final_by_key = std::collections::BTreeMap::new();
+    for operation in operations {
+        let key = (operation.column_family.as_str(), operation.key.as_str());
+        match reported.get(&operation.id) {
+            Some(MutationCertainty::Acked) => {
+                acknowledged_final_by_key.insert(key, operation);
+            }
+            Some(MutationCertainty::Unknown) => {
+                acknowledged_final_by_key.remove(&key);
+            }
+            Some(MutationCertainty::Failed) | None => {}
+        }
+    }
+    let mut commands = acknowledged_final_by_key
+        .into_values()
+        .map(worker_command_from_op)
+        .collect::<Vec<_>>();
+    commands.sort_by_key(|command| command.sequence);
+    commands
 }
 
 /// Run a complete preset catalog and write one suite manifest.
@@ -1331,6 +1675,7 @@ fn write_report(path: impl AsRef<Path>, report: &ScenarioReport) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::LeaseProfile;
+    use crate::scenario::Scenario;
     use crate::worker_protocol::{ObservedOutcome, ReportPhase};
 
     fn report() -> OperationReport {
@@ -1344,6 +1689,23 @@ mod tests {
                 sequence: 0,
                 key: "key-1".to_string(),
             },
+        }
+    }
+
+    fn mutation(id: u64, sequence: usize, key: &str, value: Option<&str>) -> MutationOp {
+        MutationOp {
+            id,
+            sequence,
+            action: value.map_or(crate::scenario::MutationAction::Delete, |_| {
+                crate::scenario::MutationAction::Put
+            }),
+            key: key.to_string(),
+            value: value.map(str::to_string),
+            durable: true,
+            workload_lane: crate::scenario::WorkloadLane::Pointwise,
+            workload_batch: 0,
+            workload_kind: crate::scenario::WorkloadKind::Pointwise,
+            column_family: "default".to_string(),
         }
     }
 
@@ -1368,6 +1730,396 @@ mod tests {
     }
 
     #[test]
+    fn should_preserve_recovery_context_after_worker_readiness() {
+        // Arrange
+        let started = Instant::now();
+        let mut pending = Some(PendingRecovery {
+            fault_class: FaultClass::ProcessKill,
+            step: 1_920,
+            started,
+            attempts: 74,
+            readiness: None,
+        });
+        let readiness = ObservedWorkerReadiness {
+            observed_at: started + Duration::from_millis(45_100),
+        };
+        let mut events = Vec::new();
+
+        // Act
+        record_ready_recovery(
+            &mut pending,
+            started + Duration::from_secs(44),
+            Some(&readiness),
+        );
+
+        // Assert
+        assert!(
+            pending.is_some(),
+            "readiness alone must not discard the retry context for a worker that can still fail"
+        );
+        assert!(
+            events.is_empty(),
+            "recovery is not complete until the ready worker reaches a stable boundary"
+        );
+        complete_ready_recovery(
+            &mut pending,
+            crate::config::RecoveryBudget {
+                warning_threshold_ms: 40_000,
+                soft_deadline_ms: 50_000,
+                hard_deadline_ms: 100_000,
+            },
+            &mut events,
+        );
+        assert!(pending.is_none());
+        assert_eq!(events[0].contention_duration_ms, 44_000);
+        assert_eq!(events[0].recovery_latency_ms, Some(45_100));
+        assert_eq!(
+            events[0].outcome,
+            RecoveryOutcome::RecoveredBeforeSoftDeadline
+        );
+    }
+
+    #[test]
+    fn should_retry_ready_worker_timeout_before_recovery_hard_deadline() {
+        // Arrange
+        let started = Instant::now();
+        let pending = PendingRecovery {
+            fault_class: FaultClass::ProcessKill,
+            step: 1_920,
+            started,
+            attempts: 2,
+            readiness: Some(RecoveryReadiness {
+                contention_duration_ms: 10_000,
+                recovery_latency_ms: 11_000,
+            }),
+        };
+        let scenario_deadline = started + Duration::from_secs(200);
+
+        // Act
+        let before_hard_deadline = can_retry_pending_recovery(
+            Some(&pending),
+            started + Duration::from_millis(99_999),
+            scenario_deadline,
+            100_000,
+        );
+        let at_hard_deadline = can_retry_pending_recovery(
+            Some(&pending),
+            started + Duration::from_secs(100),
+            scenario_deadline,
+            100_000,
+        );
+
+        // Assert
+        assert!(before_hard_deadline);
+        assert!(!at_hard_deadline);
+    }
+
+    #[test]
+    fn should_clear_lock_only_after_controller_proven_ungraceful_exit() {
+        // Arrange
+        let controller_terminated = [
+            WorkerStatus::Crashed,
+            WorkerStatus::TimedOut(WorkerTimeout::NoProgress),
+        ];
+        let graceful = [WorkerStatus::Interrupted, WorkerStatus::Ok];
+
+        // Act
+        let terminated_require_cleanup = controller_terminated
+            .into_iter()
+            .all(worker_requires_acquisition_lock_cleanup);
+        let graceful_skip_cleanup = graceful
+            .into_iter()
+            .all(|status| !worker_requires_acquisition_lock_cleanup(status));
+
+        // Assert
+        assert!(terminated_require_cleanup);
+        assert!(graceful_skip_cleanup);
+    }
+
+    #[test]
+    fn should_verify_last_acknowledged_value_when_later_plan_was_unattempted() {
+        // Arrange
+        let operations = vec![
+            MutationOp {
+                id: 10,
+                sequence: 0,
+                action: crate::scenario::MutationAction::Put,
+                key: "shared-key".to_string(),
+                value: Some("acknowledged".to_string()),
+                durable: true,
+                workload_lane: crate::scenario::WorkloadLane::Pointwise,
+                workload_batch: 0,
+                workload_kind: crate::scenario::WorkloadKind::Pointwise,
+                column_family: "default".to_string(),
+            },
+            MutationOp {
+                id: 11,
+                sequence: 1,
+                action: crate::scenario::MutationAction::Put,
+                key: "never-attempted".to_string(),
+                value: Some("planned".to_string()),
+                durable: true,
+                workload_lane: crate::scenario::WorkloadLane::Pointwise,
+                workload_batch: 0,
+                workload_kind: crate::scenario::WorkloadKind::Pointwise,
+                column_family: "default".to_string(),
+            },
+            MutationOp {
+                id: 12,
+                sequence: 2,
+                action: crate::scenario::MutationAction::Put,
+                key: "shared-key".to_string(),
+                value: Some("also-never-attempted".to_string()),
+                durable: true,
+                workload_lane: crate::scenario::WorkloadLane::Pointwise,
+                workload_batch: 0,
+                workload_kind: crate::scenario::WorkloadKind::Pointwise,
+                column_family: "default".to_string(),
+            },
+        ];
+        let reports = vec![OperationReport {
+            operation_id: 10,
+            sequence: 0,
+            key: "shared-key".to_string(),
+            phase: ReportPhase::Mutation,
+            outcome: ObservedOutcome::Acked {
+                operation_id: 10,
+                sequence: 0,
+                key: "shared-key".to_string(),
+            },
+        }];
+
+        // Act
+        let commands = acknowledged_final_state_commands(&operations, &reports);
+
+        // Assert
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].operation_id, 10);
+        assert_eq!(commands[0].value.as_deref(), Some("acknowledged"));
+    }
+
+    #[test]
+    fn should_exclude_key_when_later_mutation_outcome_is_unknown() {
+        // Arrange
+        let operations = vec![
+            mutation(20, 0, "shared-key", Some("acknowledged")),
+            mutation(21, 1, "shared-key", None),
+        ];
+        let reports = vec![
+            OperationReport {
+                operation_id: 20,
+                sequence: 0,
+                key: "shared-key".to_string(),
+                phase: ReportPhase::Mutation,
+                outcome: ObservedOutcome::Acked {
+                    operation_id: 20,
+                    sequence: 0,
+                    key: "shared-key".to_string(),
+                },
+            },
+            OperationReport {
+                operation_id: 21,
+                sequence: 1,
+                key: "shared-key".to_string(),
+                phase: ReportPhase::Mutation,
+                outcome: ObservedOutcome::Unknown {
+                    operation_id: 21,
+                    sequence: 1,
+                    key: "shared-key".to_string(),
+                },
+            },
+        ];
+
+        // Act
+        let commands = acknowledged_final_state_commands(&operations, &reports);
+
+        // Assert
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn should_restore_known_key_when_ack_follows_unknown_mutation() {
+        // Arrange
+        let operations = vec![
+            mutation(30, 0, "shared-key", Some("uncertain")),
+            mutation(31, 1, "shared-key", Some("resolved")),
+        ];
+        let reports = vec![
+            OperationReport {
+                operation_id: 30,
+                sequence: 0,
+                key: "shared-key".to_string(),
+                phase: ReportPhase::Mutation,
+                outcome: ObservedOutcome::Unknown {
+                    operation_id: 30,
+                    sequence: 0,
+                    key: "shared-key".to_string(),
+                },
+            },
+            OperationReport {
+                operation_id: 31,
+                sequence: 1,
+                key: "shared-key".to_string(),
+                phase: ReportPhase::Mutation,
+                outcome: ObservedOutcome::Acked {
+                    operation_id: 31,
+                    sequence: 1,
+                    key: "shared-key".to_string(),
+                },
+            },
+        ];
+
+        // Act
+        let commands = acknowledged_final_state_commands(&operations, &reports);
+
+        // Assert
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].operation_id, 31);
+        assert_eq!(commands[0].value.as_deref(), Some("resolved"));
+    }
+
+    #[test]
+    fn should_preserve_known_key_when_later_mutation_failed() {
+        // Arrange
+        let operations = vec![
+            mutation(40, 0, "shared-key", Some("acknowledged")),
+            mutation(41, 1, "shared-key", None),
+        ];
+        let reports = vec![
+            OperationReport {
+                operation_id: 40,
+                sequence: 0,
+                key: "shared-key".to_string(),
+                phase: ReportPhase::Mutation,
+                outcome: ObservedOutcome::Acked {
+                    operation_id: 40,
+                    sequence: 0,
+                    key: "shared-key".to_string(),
+                },
+            },
+            OperationReport {
+                operation_id: 41,
+                sequence: 1,
+                key: "shared-key".to_string(),
+                phase: ReportPhase::Mutation,
+                outcome: ObservedOutcome::Failed {
+                    operation_id: 41,
+                    sequence: 1,
+                    key: "shared-key".to_string(),
+                    error: "rejected before acknowledgement".to_string(),
+                },
+            },
+        ];
+
+        // Act
+        let commands = acknowledged_final_state_commands(&operations, &reports);
+
+        // Assert
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].operation_id, 40);
+        assert_eq!(commands[0].value.as_deref(), Some("acknowledged"));
+    }
+
+    #[test]
+    fn should_scale_cloud_snapshot_observation_budget_by_compaction_batches() {
+        // Arrange
+        let plan = DeterministicPlan::from_seed(
+            "snapshot-pinned-gc-pressure",
+            8_272_038,
+            crate::config::RunScale::Large,
+        );
+
+        // Act
+        let cloud_budget = workload_runtime_budget_ms(
+            &plan.scenario,
+            BackendKind::S3,
+            crate::config::RunScale::Large.max_runtime_ms(),
+        );
+        let local_budget = workload_runtime_budget_ms(
+            &plan.scenario,
+            BackendKind::Local,
+            crate::config::RunScale::Large.max_runtime_ms(),
+        );
+
+        // Assert
+        assert_eq!(cloud_budget, 1_140_000);
+        assert_eq!(local_budget, 120_000);
+    }
+
+    #[test]
+    fn should_timeout_worker_after_no_progress_despite_large_total_budget() {
+        // Arrange
+        let last_progress = Instant::now();
+        let no_progress_timeout = worker_no_progress_timeout(BackendKind::S3);
+
+        // Act
+        let before_limit = worker_exceeded_no_progress(
+            last_progress + Duration::from_secs(194),
+            last_progress,
+            no_progress_timeout,
+        );
+        let after_limit = worker_exceeded_no_progress(
+            last_progress + Duration::from_secs(195),
+            last_progress,
+            no_progress_timeout,
+        );
+
+        // Assert
+        assert!(!before_limit);
+        assert!(after_limit);
+    }
+
+    #[test]
+    fn should_enforce_recovery_deadline_only_until_worker_is_ready() {
+        // Arrange
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(100);
+
+        // Act
+        let waiting_before_deadline = worker_exceeded_recovery_deadline(
+            started + Duration::from_secs(99),
+            false,
+            Some(deadline),
+        );
+        let waiting_at_deadline =
+            worker_exceeded_recovery_deadline(deadline, false, Some(deadline));
+        let ready_after_deadline = worker_exceeded_recovery_deadline(
+            started + Duration::from_secs(101),
+            true,
+            Some(deadline),
+        );
+
+        // Assert
+        assert!(!waiting_before_deadline);
+        assert!(waiting_at_deadline);
+        assert!(!ready_after_deadline);
+    }
+
+    #[test]
+    fn should_treat_worker_progress_artifact_growth_as_watchdog_progress() {
+        // Arrange
+        let directory = tempfile::tempdir().expect("create progress directory");
+        let path = directory.path().join("worker-progress.jsonl");
+        let mut previous_len = 0;
+
+        // Act
+        std::fs::write(&path, b"stage-one\n").expect("write first progress stage");
+        let first_stage = observe_file_growth(&path, &mut previous_len);
+        let unchanged = observe_file_growth(&path, &mut previous_len);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open progress artifact");
+        std::io::Write::write_all(&mut file, b"stage-two\n").expect("write second progress stage");
+        let second_stage = observe_file_growth(&path, &mut previous_len);
+
+        // Assert
+        assert!(first_stage);
+        assert!(!unchanged);
+        assert!(second_stage);
+    }
+
+    #[test]
     fn should_reject_malformed_completed_report_line() {
         let directory = tempfile::tempdir().expect("create report directory");
         let path = directory.path().join("worker.jsonl");
@@ -1376,6 +2128,30 @@ mod tests {
         let result = read_report_lines(&path);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn should_collect_only_exact_worker_lifecycle_artifacts() {
+        // Arrange
+        let directory = tempfile::tempdir().expect("create lifecycle directory");
+        let lifecycle = WorkerLifecycleChannel::error("open", "Writer lease held by epoch 7");
+        let encoded = serde_json::to_vec(&lifecycle).expect("serialize lifecycle channel");
+        std::fs::write(directory.path().join("attempt-1-lifecycle.json"), &encoded)
+            .expect("write lifecycle artifact");
+        std::fs::write(
+            directory.path().join("attempt-1-lifecycle.workload.json"),
+            &encoded,
+        )
+        .expect("write workload evidence artifact");
+        std::fs::write(directory.path().join("attempt-1-readiness.json"), &encoded)
+            .expect("write readiness artifact");
+
+        // Act
+        let channels = read_lifecycle_channels(directory.path());
+
+        // Assert
+        assert_eq!(channels.len(), 1);
+        assert!(channel_reports_lease_held(&channels[0]));
     }
 
     #[test]
@@ -1402,7 +2178,7 @@ mod tests {
             Path::new("commands"),
             Path::new("report"),
             Path::new("verify"),
-            Path::new("lifecycle"),
+            Path::new("segment-1-attempt-2-lifecycle.json"),
         );
         let arguments = command
             .get_args()
@@ -1413,6 +2189,12 @@ mod tests {
         assert!(arguments
             .windows(2)
             .any(|pair| { pair == ["--provider-endpoint", "http://127.0.0.1:49153"] }));
+        assert!(arguments
+            .windows(2)
+            .any(|pair| { pair == ["--readiness-report", "segment-1-attempt-2-readiness.json",] }));
+        assert!(arguments
+            .windows(2)
+            .any(|pair| { pair == ["--progress-report", "segment-1-attempt-2-progress.json",] }));
     }
 
     #[test]
@@ -1454,10 +2236,68 @@ mod tests {
         ];
 
         // Act
-        let next = next_worker_start(0, &reports);
+        let operations =
+            Scenario::new("recovery-crash-loop", 7, crate::config::RunScale::Small).operations;
+        let next = next_worker_start(0, &reports, &operations);
 
         // Assert
         assert_eq!(next, 1);
+    }
+
+    #[test]
+    fn should_resume_mixed_workload_at_batch_boundary_after_partial_failure() {
+        // Arrange
+        let operations = Scenario::new(
+            "uuid-compaction-pressure",
+            7,
+            crate::config::RunScale::Small,
+        )
+        .operations;
+        let reports = vec![
+            OperationReport {
+                operation_id: 11,
+                sequence: 0,
+                key: "batch-key".to_string(),
+                phase: ReportPhase::Mutation,
+                outcome: ObservedOutcome::Acked {
+                    operation_id: 11,
+                    sequence: 0,
+                    key: "batch-key".to_string(),
+                },
+            },
+            OperationReport {
+                operation_id: 12,
+                sequence: 1,
+                key: "failed-trickle-key".to_string(),
+                phase: ReportPhase::Mutation,
+                outcome: ObservedOutcome::Failed {
+                    operation_id: 12,
+                    sequence: 1,
+                    key: "failed-trickle-key".to_string(),
+                    error: "fenced".to_string(),
+                },
+            },
+            OperationReport {
+                operation_id: 13,
+                sequence: 2,
+                key: "later-trickle-key".to_string(),
+                phase: ReportPhase::Mutation,
+                outcome: ObservedOutcome::Acked {
+                    operation_id: 13,
+                    sequence: 2,
+                    key: "later-trickle-key".to_string(),
+                },
+            },
+        ];
+
+        // Act
+        let next = next_worker_start(0, &reports, &operations);
+
+        // Assert
+        assert_eq!(
+            next, 0,
+            "a partial concurrent chunk must replay from its original boundary"
+        );
     }
 
     #[test]
@@ -1468,10 +2308,11 @@ mod tests {
         std::fs::write(&lock, "terminated worker").expect("write acquisition lock");
 
         // Act
-        clear_terminated_worker_acquisition_lock(directory.path())
+        let removed = clear_terminated_worker_acquisition_lock(directory.path())
             .expect("clear terminated worker lock");
 
         // Assert
+        assert!(removed);
         assert!(!lock.exists());
     }
 

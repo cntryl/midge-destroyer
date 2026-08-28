@@ -11,7 +11,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
-use midge_destroyer::worker_protocol::{LifecycleReport, WorkerLifecycleChannel};
+use midge_destroyer::worker_protocol::{
+    LifecycleReport, WorkerLifecycleChannel, WorkerProgressReport, WorkerReadinessReport,
+};
 use midge_destroyer::{
     failpoint,
     worker_protocol::{ObservedOutcome, OperationReport, ReportPhase, WorkerCommand},
@@ -21,6 +23,63 @@ enum WorkerCompletion {
     Complete,
     Interrupted,
     Incomplete,
+}
+
+trait GracefulShutdown {
+    fn shutdown_with_timeout(&mut self, timeout: Duration) -> Result<(), String>;
+}
+
+impl GracefulShutdown for cntryl_midge::Engine {
+    fn shutdown_with_timeout(&mut self, timeout: Duration) -> Result<(), String> {
+        self.shutdown(timeout).map_err(|error| error.to_string())
+    }
+}
+
+struct EngineShutdownGuard<T: GracefulShutdown> {
+    engine: T,
+    timeout: Duration,
+    shutdown_attempted: bool,
+}
+
+impl<T: GracefulShutdown> EngineShutdownGuard<T> {
+    fn new(engine: T, timeout: Duration) -> Self {
+        Self {
+            engine,
+            timeout,
+            shutdown_attempted: false,
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        self.shutdown_attempted = true;
+        self.engine.shutdown_with_timeout(self.timeout)
+    }
+}
+
+impl<T: GracefulShutdown> std::ops::Deref for EngineShutdownGuard<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.engine
+    }
+}
+
+impl<T: GracefulShutdown> std::ops::DerefMut for EngineShutdownGuard<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.engine
+    }
+}
+
+impl<T: GracefulShutdown> Drop for EngineShutdownGuard<T> {
+    fn drop(&mut self) {
+        if self.shutdown_attempted {
+            return;
+        }
+        self.shutdown_attempted = true;
+        if let Err(error) = self.engine.shutdown_with_timeout(self.timeout) {
+            eprintln!("worker engine shutdown after an error failed: {error}");
+        }
+    }
 }
 
 type ScannedRows = Vec<(Vec<u8>, Vec<u8>)>;
@@ -57,6 +116,12 @@ struct WorkerArgs {
 
     #[arg(long)]
     lifecycle_report: PathBuf,
+
+    #[arg(long)]
+    readiness_report: PathBuf,
+
+    #[arg(long)]
+    progress_report: PathBuf,
 
     #[arg(long, default_value = "conservative")]
     lease_profile: String,
@@ -181,7 +246,9 @@ fn run_engine(
     let options_ms = options_started.elapsed().as_millis();
 
     let open_started = std::time::Instant::now();
-    let mut engine = cntryl_midge::Engine::open(open_options).map_err(|error| error.to_string())?;
+    let engine = cntryl_midge::Engine::open(open_options).map_err(|error| error.to_string())?;
+    let mut engine =
+        EngineShutdownGuard::new(engine, graceful_shutdown_timeout(&args.cloud_provider));
     let open_ms = open_started.elapsed().as_millis();
     let default_cf = engine
         .get_column_family("default")
@@ -194,6 +261,16 @@ fn run_engine(
             .map_err(|error| error.to_string())?;
         column_families.insert(name, handle);
     }
+    write_readiness(
+        args,
+        &WorkerReadinessReport {
+            schema_version: "midge-destroyer.readiness/v1".to_string(),
+            options_ms,
+            open_ms,
+            ready_ms: total_started.elapsed().as_millis(),
+        },
+    )?;
+    write_progress(args, "ready", 0)?;
 
     let mutations_started = std::time::Instant::now();
     let mut first_mutation_ms = None;
@@ -241,7 +318,7 @@ fn run_engine(
         if Some(index) == args.interrupt_on_step {
             let mutations_ms = mutations_started.elapsed().as_millis();
             let shutdown_started = std::time::Instant::now();
-            let shutdown_result = engine.shutdown(graceful_shutdown_timeout(&args.cloud_provider));
+            let shutdown_result = engine.shutdown();
             let shutdown_ms = shutdown_started.elapsed().as_millis();
             write_lifecycle(
                 args,
@@ -258,11 +335,12 @@ fn run_engine(
                     crashed: false,
                 },
             )?;
-            shutdown_result.map_err(|error| error.to_string())?;
+            shutdown_result?;
             return Ok(WorkerCompletion::Interrupted);
         }
 
         let operation_started = std::time::Instant::now();
+        write_progress(args, "mutation-start", index)?;
         let (next_index, outcomes) = if mixed_chunk {
             execute_workload_chunk(
                 &engine,
@@ -271,6 +349,7 @@ fn run_engine(
                 index,
                 cloud,
                 crash_during_chunk,
+                args,
             )?
         } else {
             let cf = column_family_for(&column_families, command)?;
@@ -279,6 +358,7 @@ fn run_engine(
                 vec![execute_command(&engine, cf, command, cloud)],
             )
         };
+        write_progress(args, "mutation-complete", next_index)?;
         if first_mutation_ms.is_none() {
             first_mutation_ms = Some(operation_started.elapsed().as_millis());
         }
@@ -330,15 +410,18 @@ fn run_engine(
 
     let mutations_ms = mutations_started.elapsed().as_millis();
     let verification_started = std::time::Instant::now();
+    write_progress(args, "verification-start", commands.len())?;
     if let Some(all_commands) = &verification_commands {
         verify_final_state(&engine, &column_families, all_commands, report_file)?;
         validate_workload_invariants(&engine, all_commands)?;
         write_workload_evidence(&engine, args, all_commands)?;
     }
     let verification_ms = verification_started.elapsed().as_millis();
+    write_progress(args, "verification-complete", commands.len())?;
 
     let shutdown_started = std::time::Instant::now();
-    let shutdown_result = engine.shutdown(graceful_shutdown_timeout(&args.cloud_provider));
+    write_progress(args, "shutdown-start", commands.len())?;
+    let shutdown_result = engine.shutdown();
     let shutdown_ms = shutdown_started.elapsed().as_millis();
     write_lifecycle(
         args,
@@ -355,7 +438,7 @@ fn run_engine(
             crashed: false,
         },
     )?;
-    shutdown_result.map_err(|error| error.to_string())?;
+    shutdown_result?;
 
     Ok(WorkerCompletion::Complete)
 }
@@ -391,6 +474,32 @@ fn write_lifecycle(args: &WorkerArgs, report: LifecycleReport) -> Result<(), Str
             .map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())
+}
+
+fn write_readiness(args: &WorkerArgs, report: &WorkerReadinessReport) -> Result<(), String> {
+    let temporary = args.readiness_report.with_extension("readiness.tmp");
+    std::fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    std::fs::rename(&temporary, &args.readiness_report).map_err(|error| error.to_string())
+}
+
+fn write_progress(args: &WorkerArgs, stage: &str, operation_index: usize) -> Result<(), String> {
+    let report = WorkerProgressReport {
+        schema_version: "midge-destroyer.progress/v1".to_string(),
+        stage: stage.to_string(),
+        operation_index,
+    };
+    let mut line = serde_json::to_vec(&report).map_err(|error| error.to_string())?;
+    line.push(b'\n');
+    let mut file = FsOpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&args.progress_report)
+        .map_err(|error| error.to_string())?;
+    file.write_all(&line).map_err(|error| error.to_string())
 }
 
 fn write_lifecycle_error(
@@ -554,6 +663,7 @@ fn execute_workload_chunk(
     start: usize,
     cloud: bool,
     crash_during_chunk: bool,
+    args: &WorkerArgs,
 ) -> Result<(usize, Vec<ObservedOutcome>), String> {
     let kind = commands[start].workload_kind;
     match kind {
@@ -564,6 +674,7 @@ fn execute_workload_chunk(
             start,
             cloud,
             crash_during_chunk,
+            args,
         ),
         WorkloadKind::MultiCfHotCold => execute_multi_cf_chunk(
             engine,
@@ -705,6 +816,7 @@ fn execute_snapshot_pinned_chunk(
     start: usize,
     cloud: bool,
     crash_during_chunk: bool,
+    args: &WorkerArgs,
 ) -> Result<(usize, Vec<ObservedOutcome>), String> {
     let end = workload_chunk_end(commands, start);
     let chunk = commands[start..end].iter().collect::<Vec<_>>();
@@ -719,6 +831,7 @@ fn execute_snapshot_pinned_chunk(
         return Err("snapshot workload did not register an active snapshot pin".to_string());
     }
     let before = collect_range_scan(&snapshot)?;
+    write_progress(args, "snapshot-initial-scan-complete", start)?;
     if crash_during_chunk {
         std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(2));
@@ -726,9 +839,13 @@ fn execute_snapshot_pinned_chunk(
         });
     }
     let outcomes = execute_batch_commands(engine, cf, &chunk, cloud);
+    write_progress(args, "snapshot-batch-complete", end)?;
     engine.flush_cf(cf).map_err(|error| error.to_string())?;
+    write_progress(args, "snapshot-flush-complete", end)?;
     engine.compact_all().map_err(|error| error.to_string())?;
+    write_progress(args, "snapshot-compaction-complete", end)?;
     let after = collect_range_scan(&snapshot)?;
+    write_progress(args, "snapshot-final-scan-complete", end)?;
     if before != after {
         return Err("snapshot changed while overwrite/delete compaction ran".to_string());
     }
@@ -1096,10 +1213,22 @@ mod tests {
     use super::{
         graceful_shutdown_timeout, lease_durations, mixed_read_probe_count,
         required_column_family_names, runtime_response_timeout, should_force_manual_compaction,
+        EngineShutdownGuard, GracefulShutdown,
     };
     use midge_destroyer::scenario::{MutationAction, WorkloadKind, WorkloadLane};
     use midge_destroyer::worker_protocol::WorkerCommand;
     use std::time::Duration;
+
+    struct CountingShutdown {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl GracefulShutdown for CountingShutdown {
+        fn shutdown_with_timeout(&mut self, _timeout: Duration) -> Result<(), String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     fn command(column_family: &str) -> WorkerCommand {
         WorkerCommand {
@@ -1114,6 +1243,44 @@ mod tests {
             workload_kind: WorkloadKind::MultiCfHotCold,
             column_family: column_family.to_string(),
         }
+    }
+
+    #[test]
+    fn should_shutdown_opened_engine_when_worker_path_returns_early() {
+        // Arrange
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // Act
+        {
+            let _engine = EngineShutdownGuard::new(
+                CountingShutdown {
+                    calls: std::sync::Arc::clone(&calls),
+                },
+                Duration::from_secs(1),
+            );
+        }
+
+        // Assert
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn should_not_repeat_explicit_worker_engine_shutdown_on_drop() {
+        // Arrange
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine = EngineShutdownGuard::new(
+            CountingShutdown {
+                calls: std::sync::Arc::clone(&calls),
+            },
+            Duration::from_secs(1),
+        );
+
+        // Act
+        engine.shutdown().expect("shut down engine");
+        drop(engine);
+
+        // Assert
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

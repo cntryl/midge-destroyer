@@ -99,57 +99,82 @@ impl Ledger {
         observed: &[OperationReport],
         unobserved: MutationOutcome,
     ) {
-        let mut mutation_ids = HashSet::new();
-        for report in observed {
-            match report.phase {
-                ReportPhase::Verification => match &report.outcome {
-                    ObservedOutcome::Failed { .. } => {
-                        self.mark(report.operation_id, MutationOutcome::Missing);
+        let mut mutation_identities = HashMap::new();
+        for report in observed
+            .iter()
+            .filter(|report| report.phase == ReportPhase::Mutation)
+        {
+            let identity = (report.sequence, report.key.clone());
+            let inconsistent_replay = mutation_identities
+                .insert(report.operation_id, identity.clone())
+                .is_some_and(|previous| previous != identity);
+            if let Some(entry) = self
+                .entries
+                .iter_mut()
+                .find(|entry| entry.operation_id == report.operation_id)
+            {
+                if inconsistent_replay {
+                    entry.classification = MutationOutcome::Duplicate;
+                    continue;
+                }
+                match &report.outcome {
+                    // Controller-directed retry can deliberately replay the
+                    // same immutable operation after a partial concurrent
+                    // batch. An identical acknowledgement is idempotent
+                    // evidence, not a duplicate application finding.
+                    ObservedOutcome::Acked { .. } => {
+                        if entry.classification != MutationOutcome::Duplicate {
+                            entry.classification = MutationOutcome::Acked;
+                        }
                     }
-                    ObservedOutcome::Unknown { .. } => {
-                        self.mark(report.operation_id, MutationOutcome::Unknown);
+                    ObservedOutcome::Failed { .. }
+                        if !matches!(
+                            entry.classification,
+                            MutationOutcome::Acked | MutationOutcome::Duplicate
+                        ) =>
+                    {
+                        entry.classification = MutationOutcome::Failed;
+                    }
+                    ObservedOutcome::Unknown { .. }
+                        if entry.classification == MutationOutcome::Dispatched =>
+                    {
+                        entry.classification = MutationOutcome::Unknown;
+                    }
+                    ObservedOutcome::Failed { .. } | ObservedOutcome::Unknown { .. } => {}
+                }
+            }
+        }
+
+        for report in observed
+            .iter()
+            .filter(|report| report.phase == ReportPhase::Verification)
+        {
+            if let Some(entry) = self
+                .entries
+                .iter_mut()
+                .find(|entry| entry.operation_id == report.operation_id)
+            {
+                match &report.outcome {
+                    // Absence is a durability violation only when this exact
+                    // mutation was acknowledged. A full-plan verifier can
+                    // encounter an operation that was never attempted after
+                    // an availability failure; retain that as unknown.
+                    ObservedOutcome::Failed { .. }
+                        if entry.classification == MutationOutcome::Acked =>
+                    {
+                        entry.classification = MutationOutcome::Missing;
+                    }
+                    ObservedOutcome::Unknown { .. }
+                        if entry.classification != MutationOutcome::Duplicate =>
+                    {
+                        entry.classification = MutationOutcome::Unknown;
                     }
                     ObservedOutcome::Acked { .. } => {
-                        if let Some(entry) = self
-                            .entries
-                            .iter_mut()
-                            .find(|entry| entry.operation_id == report.operation_id)
-                        {
-                            if entry.classification != MutationOutcome::Duplicate {
-                                entry.classification = MutationOutcome::Acked;
-                            }
+                        if entry.classification != MutationOutcome::Duplicate {
+                            entry.classification = MutationOutcome::Acked;
                         }
                     }
-                },
-                ReportPhase::Mutation => {
-                    let repeated = !mutation_ids.insert(report.operation_id);
-                    if let Some(entry) = self
-                        .entries
-                        .iter_mut()
-                        .find(|entry| entry.operation_id == report.operation_id)
-                    {
-                        match &report.outcome {
-                            ObservedOutcome::Acked { .. }
-                                if repeated && entry.classification == MutationOutcome::Acked =>
-                            {
-                                entry.classification = MutationOutcome::Duplicate;
-                            }
-                            ObservedOutcome::Acked { .. } => {
-                                entry.classification = MutationOutcome::Acked;
-                            }
-                            ObservedOutcome::Failed { .. }
-                                if entry.classification != MutationOutcome::Acked =>
-                            {
-                                entry.classification = MutationOutcome::Failed;
-                            }
-                            ObservedOutcome::Unknown { .. }
-                                if entry.classification == MutationOutcome::Dispatched =>
-                            {
-                                entry.classification = MutationOutcome::Unknown;
-                            }
-                            ObservedOutcome::Failed { .. } | ObservedOutcome::Unknown { .. } => {}
-                        }
-                    }
+                    ObservedOutcome::Failed { .. } | ObservedOutcome::Unknown { .. } => {}
                 }
             }
         }
@@ -342,6 +367,69 @@ mod tests {
 
         // Assert
         assert_eq!(ledger.entries[0].classification, MutationOutcome::Unknown);
+    }
+
+    #[test]
+    fn should_treat_identical_replay_ack_as_idempotent() {
+        // Arrange
+        let mut ledger = Ledger::with_entries(vec![LedgerEntry {
+            operation_id: 7,
+            sequence: 3,
+            classification: MutationOutcome::Dispatched,
+            key: "replayed-key".to_string(),
+            value: "value".to_string(),
+        }]);
+        let report = OperationReport {
+            operation_id: 7,
+            sequence: 3,
+            key: "replayed-key".to_string(),
+            phase: ReportPhase::Mutation,
+            outcome: ObservedOutcome::Acked {
+                operation_id: 7,
+                sequence: 3,
+                key: "replayed-key".to_string(),
+            },
+        };
+
+        // Act
+        ledger.classify_reports(&[report.clone(), report]);
+
+        // Assert
+        let classifier = OutcomeClassifier::from_ledger(&ledger);
+        assert_eq!(classifier.acked, 1);
+        assert_eq!(classifier.duplicate, 0);
+    }
+
+    #[test]
+    fn should_not_mark_unattempted_operation_missing_from_full_plan_verifier() {
+        // Arrange
+        let mut ledger = Ledger::with_entries(vec![LedgerEntry {
+            operation_id: 9,
+            sequence: 8,
+            classification: MutationOutcome::Dispatched,
+            key: "unattempted-key".to_string(),
+            value: "planned-value".to_string(),
+        }]);
+        let verification = OperationReport {
+            operation_id: 9,
+            sequence: 8,
+            key: "unattempted-key".to_string(),
+            phase: ReportPhase::Verification,
+            outcome: ObservedOutcome::Failed {
+                operation_id: 9,
+                sequence: 8,
+                key: "unattempted-key".to_string(),
+                error: "expected planned value, got none".to_string(),
+            },
+        };
+
+        // Act
+        ledger.classify_reports_after_timeout(&[verification]);
+
+        // Assert
+        let classifier = OutcomeClassifier::from_ledger(&ledger);
+        assert_eq!(classifier.missing, 0);
+        assert_eq!(classifier.unknown, 1);
     }
 
     #[test]
