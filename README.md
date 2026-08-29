@@ -23,9 +23,10 @@ Executable black-box scenarios include `recovery-crash-loop`,
 `scan-compaction-starvation`, `snapshot-pinned-gc-pressure`,
 `multi-cf-hot-cold-interference`, `delete-space-amplification`,
 `cold-cache-read-storm`, `ack-kill-window`, `cloud-cache-loss`,
-`manifest-race`, `sst-corruption`, and `sqrzl-visibility`.
-`cloud-cache-loss` and `cold-cache-read-storm` require `s3`, `azure`, `gcs`,
-or another cloud backend.
+`manifest-race`, `sst-corruption`, `wal-truncation-race`,
+`stale-cache-recovery`, and `sqrzl-visibility`.
+`cloud-cache-loss`, `cold-cache-read-storm`, and `stale-cache-recovery`
+require `s3`, `azure`, `gcs`, or another cloud backend.
 
 Exact engine-cut scenarios require `--features failpoint-tier`:
 `wal-sync-ack-cut`, `manifest-sync-failure`, `compaction-commit-cut`,

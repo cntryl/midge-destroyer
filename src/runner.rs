@@ -1092,13 +1092,28 @@ fn apply_fault(path: &Path, fault: &crate::scenario::ScenarioFault) -> Result<()
                 "return",
             )?;
         }
+        FaultClass::LeaseStalenessWindow => {
+            // Hold the boundary open past a plausible lease heartbeat interval so the
+            // previous holder's lease can genuinely go stale before the next worker
+            // attempts acquisition, instead of only marking the boundary.
+            std::fs::write(path.join("fault-marker"), b"marker")?;
+            std::thread::sleep(Duration::from_millis(1_500));
+        }
+        FaultClass::RegionPartition => {
+            // Hold the boundary open long enough to model the round-trip cost of a
+            // partitioned region reconnecting, distinct from a single-hop latency spike.
+            std::fs::write(path.join("fault-marker"), b"marker")?;
+            std::thread::sleep(Duration::from_millis(750));
+        }
         FaultClass::ProcessKill
         | FaultClass::AckBeforeReportCrash
         | FaultClass::ForcedReopen
-        | FaultClass::LeaseStalenessWindow
-        | FaultClass::RegionPartition
         | FaultClass::StrictAsyncDurabilityFlip
         | FaultClass::MigrationBoundaryFault => {
+            // StrictAsyncDurabilityFlip has no filesystem side effect: the durability
+            // mode it alternates is already encoded per-operation on the generated
+            // workload (`MutationOp::durable`), so the fault boundary only needs to be
+            // marked for artifact traceability.
             std::fs::write(path.join("fault-marker"), b"marker")?;
         }
         FaultClass::CloudCacheLoss => {

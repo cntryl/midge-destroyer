@@ -227,6 +227,20 @@ const SCENARIO_CATALOG: &[ScenarioDefinition] = &[
         smoke: false,
     },
     ScenarioDefinition {
+        name: "wal-truncation-race",
+        applicability: BackendApplicability::Any,
+        required_feature: None,
+        expected_behavior: FaultExpectation::SafetyPreserved,
+        smoke: false,
+    },
+    ScenarioDefinition {
+        name: "stale-cache-recovery",
+        applicability: BackendApplicability::CloudOnly,
+        required_feature: None,
+        expected_behavior: FaultExpectation::SafetyPreserved,
+        smoke: false,
+    },
+    ScenarioDefinition {
         name: "wal-sync-ack-cut",
         applicability: BackendApplicability::Any,
         required_feature: Some("failpoint-tier"),
@@ -774,6 +788,8 @@ fn fault_catalog(name: &str) -> &'static [FaultClass] {
         ],
         "manifest-race" => &[FaultClass::ManifestInterruption],
         "sst-corruption" => &[FaultClass::SstCorruption],
+        "wal-truncation-race" => &[FaultClass::WalTruncationRace],
+        "stale-cache-recovery" => &[FaultClass::StaleCacheCleanup],
         "sqrzl-visibility" => &[
             FaultClass::ProviderLatencySpike,
             FaultClass::RegionPartition,
@@ -1083,6 +1099,40 @@ mod tests {
             .count();
         let cold = scenario.operations.len().saturating_sub(hot);
         assert!(hot >= cold.saturating_mul(3));
+    }
+
+    #[test]
+    fn should_only_generate_wal_truncation_faults_for_wal_truncation_race() {
+        let plan = DeterministicPlan::from_seed("wal-truncation-race", 3, RunScale::Small);
+        assert!(!plan.scenario.faults.is_empty());
+        assert!(plan
+            .scenario
+            .faults
+            .iter()
+            .all(|fault| fault.class == FaultClass::WalTruncationRace));
+    }
+
+    #[test]
+    fn should_only_generate_stale_cache_faults_for_stale_cache_recovery() {
+        let plan = DeterministicPlan::from_seed("stale-cache-recovery", 3, RunScale::Small);
+        assert!(!plan.scenario.faults.is_empty());
+        assert!(plan
+            .scenario
+            .faults
+            .iter()
+            .all(|fault| fault.class == FaultClass::StaleCacheCleanup));
+    }
+
+    #[test]
+    fn should_scope_stale_cache_recovery_to_cloud_backends() {
+        let s3 = suite_scenarios(SuitePreset::Standard, BackendKind::S3, false);
+        let local = suite_scenarios(SuitePreset::Standard, BackendKind::Local, false);
+        assert!(s3
+            .iter()
+            .any(|selection| selection.definition.name == "stale-cache-recovery"));
+        assert!(!local
+            .iter()
+            .any(|selection| selection.definition.name == "stale-cache-recovery"));
     }
 
     #[test]

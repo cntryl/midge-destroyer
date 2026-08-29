@@ -54,9 +54,20 @@ impl LeaseProfile {
         requested_hard_deadline_ms: u64,
         ttl_ms: u64,
     ) -> RecoveryBudget {
-        let soft_deadline_ms = self.skew_ms().saturating_add(ttl_ms).saturating_add(5_000);
+        // A fenced takeover cannot legitimately complete faster than `skew + ttl`
+        // from the crashed holder's last renewal (worst case: it crashed right
+        // after renewing) — that wait is required to preserve the single-writer
+        // fencing guarantee, not something recovery code can shortcut. The old
+        // `soft_deadline * 80%` heuristic could land the warning threshold below
+        // that floor (e.g. bounded-failover against a non-local backend, which
+        // falls back to the conservative 30s TTL): a scenario would then be
+        // graded `wobble` or worse for every single crash-recovery, regardless of
+        // engine behavior. Anchor the thresholds to the floor instead.
+        let mandatory_wait_floor_ms = self.skew_ms().saturating_add(ttl_ms);
+        let warning_threshold_ms = mandatory_wait_floor_ms.saturating_add(3_000);
+        let soft_deadline_ms = warning_threshold_ms.saturating_add(5_000);
         RecoveryBudget {
-            warning_threshold_ms: soft_deadline_ms.saturating_mul(80) / 100,
+            warning_threshold_ms,
             soft_deadline_ms,
             hard_deadline_ms: requested_hard_deadline_ms.max(soft_deadline_ms.saturating_mul(2)),
         }
@@ -194,6 +205,7 @@ impl ScenarioConfig {
 #[cfg(test)]
 mod tests {
     use super::{LeaseProfile, RecoveryBudget};
+    use crate::types::BackendKind;
 
     #[test]
     fn should_preserve_conservative_recovery_budget() {
@@ -207,9 +219,9 @@ mod tests {
         assert_eq!(
             budget,
             RecoveryBudget {
-                warning_threshold_ms: 40_000,
-                soft_deadline_ms: 50_000,
-                hard_deadline_ms: 100_000,
+                warning_threshold_ms: 48_000,
+                soft_deadline_ms: 53_000,
+                hard_deadline_ms: 106_000,
             }
         );
     }
@@ -226,10 +238,37 @@ mod tests {
         assert_eq!(
             budget,
             RecoveryBudget {
-                warning_threshold_ms: 16_000,
-                soft_deadline_ms: 20_000,
+                warning_threshold_ms: 18_000,
+                soft_deadline_ms: 23_000,
                 hard_deadline_ms: 120_000,
             }
         );
+    }
+
+    #[test]
+    fn should_keep_warning_threshold_achievable_for_bounded_failover_against_cloud_backend() {
+        // Arrange: bounded-failover falls back to the conservative 30s TTL against
+        // any non-local backend (clock skew across distributed nodes is too risky
+        // for the aggressive 10s local TTL), so its recovery budget must be built
+        // from that wider TTL, not the profile's nominal (local) one.
+        let cloud_ttl_ms = LeaseProfile::BoundedFailover.ttl_ms_for_backend(BackendKind::S3);
+        let skew_ms = LeaseProfile::BoundedFailover.skew_ms();
+        let mandatory_wait_floor_ms = skew_ms + cloud_ttl_ms;
+
+        // Act
+        let budget =
+            LeaseProfile::BoundedFailover.recovery_budget_with_ttl(120_000, cloud_ttl_ms);
+
+        // Assert: a fenced takeover cannot finish before the floor, so a correctly
+        // calibrated budget must grade that as achievable, not as a guaranteed
+        // wobble/bend.
+        assert!(
+            budget.warning_threshold_ms >= mandatory_wait_floor_ms,
+            "warning threshold {} must be at or above the mandatory wait floor {}",
+            budget.warning_threshold_ms,
+            mandatory_wait_floor_ms
+        );
+        assert!(budget.soft_deadline_ms > budget.warning_threshold_ms);
+        assert!(budget.hard_deadline_ms > budget.soft_deadline_ms);
     }
 }
