@@ -16,16 +16,18 @@ pub struct BackendConfig {
 }
 
 impl BackendConfig {
+    #[must_use]
     pub fn local_root(seed: u64, scale: usize) -> String {
         format!("artifacts/db/local-{seed}-{scale}")
     }
 
+    #[must_use]
     pub fn sqrzl_root(seed: u64, scale: usize) -> String {
         format!("artifacts/db/sqrzl-{seed}-{scale}")
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendKind {
     Local,
@@ -36,10 +38,12 @@ pub enum BackendKind {
 }
 
 impl BackendKind {
+    #[must_use]
     pub fn is_cloud(self) -> bool {
         !matches!(self, BackendKind::Local)
     }
 
+    #[must_use]
     pub fn as_arg(self) -> &'static str {
         match self {
             Self::Local => "local",
@@ -50,6 +54,7 @@ impl BackendKind {
         }
     }
 
+    #[must_use]
     pub fn requires_manual_opt_in(self) -> bool {
         matches!(self, Self::Sqrzl)
     }

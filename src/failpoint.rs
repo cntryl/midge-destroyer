@@ -9,6 +9,11 @@ pub struct FailpointSentinel {
     pub consumed: bool,
 }
 
+/// Persist a one-shot failpoint sentinel.
+///
+/// # Errors
+///
+/// Returns an error when serialization or writing fails.
 pub fn write_sentinel(dir: &Path, name: &str, payload: &str) -> std::io::Result<PathBuf> {
     let path = dir.join(format!("sentinel-{name}.json"));
     let body = FailpointSentinel {
@@ -16,25 +21,35 @@ pub fn write_sentinel(dir: &Path, name: &str, payload: &str) -> std::io::Result<
         payload: payload.to_string(),
         consumed: false,
     };
-    fs::write(
-        &path,
-        serde_json::to_vec_pretty(&body).expect("serialize failpoint sentinel"),
-    )?;
+    let serialized = serde_json::to_vec_pretty(&body)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    fs::write(&path, serialized)?;
     Ok(path)
 }
 
+/// List all failpoint sentinel JSON files in a directory.
+///
+/// # Errors
+///
+/// Returns an error when the directory cannot be read.
 pub fn list_sentinels(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(std::fs::read_dir(dir)?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("sentinel-") && name.ends_with(".json"))
+                .is_some_and(|name| {
+                    name.starts_with("sentinel-")
+                        && path
+                            .extension()
+                            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+                })
         })
         .collect())
 }
 
 #[cfg(feature = "failpoint-tier")]
+#[must_use]
 pub fn activate_sentinels(dir: &Path) -> Vec<(String, String)> {
     let mut activations = Vec::new();
     let Ok(entries) = list_sentinels(dir) else {
@@ -56,18 +71,16 @@ pub fn activate_sentinels(dir: &Path) -> Vec<(String, String)> {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(feature = "failpoint-tier")]
-    {
-        for (name, payload) in &activations {
-            let point = name.to_string();
-            let _ = fail::cfg(&point, payload);
-        }
+    for (name, payload) in &activations {
+        let point = name.clone();
+        let _ = fail::cfg(&point, payload);
     }
 
     activations
 }
 
 #[cfg(not(feature = "failpoint-tier"))]
+#[must_use]
 pub fn activate_sentinels(_dir: &Path) -> Vec<(String, String)> {
     Vec::new()
 }

@@ -1,5 +1,79 @@
-use crate::scenario::MutationAction;
+use crate::scenario::{MutationAction, WorkloadKind, WorkloadLane};
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LifecycleReport {
+    pub options_ms: u128,
+    pub open_ms: u128,
+    pub mutations_ms: u128,
+    pub first_mutation_ms: Option<u128>,
+    pub verification_ms: u128,
+    pub shutdown_ms: u128,
+    pub total_ms: u128,
+    pub operations_completed: usize,
+    pub interrupted: bool,
+    pub crashed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LifecycleErrorReport {
+    pub stage: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerLifecycleChannel {
+    pub schema_version: String,
+    #[serde(default)]
+    pub lifecycle: Option<LifecycleReport>,
+    #[serde(default)]
+    pub errors: Vec<LifecycleErrorReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerReadinessReport {
+    pub schema_version: String,
+    pub options_ms: u128,
+    pub open_ms: u128,
+    pub ready_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerProgressReport {
+    pub schema_version: String,
+    pub stage: String,
+    pub operation_index: usize,
+}
+
+impl WorkerLifecycleChannel {
+    #[must_use]
+    pub fn timing(lifecycle: LifecycleReport) -> Self {
+        Self {
+            schema_version: "midge-destroyer.lifecycle/v2".to_string(),
+            lifecycle: Some(lifecycle),
+            errors: Vec::new(),
+        }
+    }
+
+    pub fn error(stage: impl Into<String>, error: impl Into<String>) -> Self {
+        Self {
+            schema_version: "midge-destroyer.lifecycle/v2".to_string(),
+            lifecycle: None,
+            errors: vec![LifecycleErrorReport {
+                stage: stage.into(),
+                error: error.into(),
+            }],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportPhase {
+    #[default]
+    Mutation,
+    Verification,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerCommand {
@@ -9,6 +83,18 @@ pub struct WorkerCommand {
     pub key: String,
     pub value: Option<String>,
     pub durable: bool,
+    #[serde(default)]
+    pub workload_lane: WorkloadLane,
+    #[serde(default)]
+    pub workload_batch: usize,
+    #[serde(default)]
+    pub workload_kind: WorkloadKind,
+    #[serde(default = "default_column_family")]
+    pub column_family: String,
+}
+
+fn default_column_family() -> String {
+    "default".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +103,8 @@ pub struct OperationReport {
     pub operation_id: u64,
     pub sequence: usize,
     pub key: String,
+    #[serde(default)]
+    pub phase: ReportPhase,
     pub outcome: ObservedOutcome,
 }
 
@@ -42,11 +130,94 @@ pub enum ObservedOutcome {
 }
 
 impl ObservedOutcome {
+    #[must_use]
     pub fn operation_id(&self) -> u64 {
         match self {
             Self::Acked { operation_id, .. }
             | Self::Failed { operation_id, .. }
             | Self::Unknown { operation_id, .. } => *operation_id,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        OperationReport, WorkerCommand, WorkerLifecycleChannel, WorkerProgressReport,
+        WorkerReadinessReport,
+    };
+    use crate::scenario::{WorkloadKind, WorkloadLane};
+
+    #[test]
+    fn should_keep_lifecycle_errors_out_of_mutation_report_schema() {
+        // Arrange
+        let lifecycle = WorkerLifecycleChannel::error("engine", "Writer lease held");
+        let serialized = serde_json::to_value(lifecycle).expect("serialize lifecycle channel");
+
+        // Act
+        let mutation = serde_json::from_value::<OperationReport>(serialized);
+
+        // Assert
+        assert!(mutation.is_err());
+    }
+
+    #[test]
+    fn should_default_legacy_commands_to_pointwise_default_column_family() {
+        // Arrange
+        let raw = serde_json::json!({
+            "operation_id": 1,
+            "sequence": 0,
+            "action": "put",
+            "key": "key",
+            "value": "value",
+            "durable": true,
+            "workload_lane": "pointwise",
+            "workload_batch": 0
+        });
+
+        // Act
+        let command: WorkerCommand = serde_json::from_value(raw).expect("deserialize command");
+
+        // Assert
+        assert_eq!(command.workload_kind, WorkloadKind::Pointwise);
+        assert_eq!(command.workload_lane, WorkloadLane::Pointwise);
+        assert_eq!(command.column_family, "default");
+    }
+
+    #[test]
+    fn should_round_trip_worker_readiness_report() {
+        // Arrange
+        let report = WorkerReadinessReport {
+            schema_version: "midge-destroyer.readiness/v1".to_string(),
+            options_ms: 2,
+            open_ms: 900,
+            ready_ms: 1_100,
+        };
+
+        // Act
+        let encoded = serde_json::to_vec(&report).expect("serialize readiness report");
+        let decoded: WorkerReadinessReport =
+            serde_json::from_slice(&encoded).expect("deserialize readiness report");
+
+        // Assert
+        assert_eq!(decoded, report);
+    }
+
+    #[test]
+    fn should_round_trip_worker_progress_report() {
+        // Arrange
+        let report = WorkerProgressReport {
+            schema_version: "midge-destroyer.progress/v1".to_string(),
+            stage: "snapshot-compaction-complete".to_string(),
+            operation_index: 256,
+        };
+
+        // Act
+        let encoded = serde_json::to_vec(&report).expect("serialize progress report");
+        let decoded: WorkerProgressReport =
+            serde_json::from_slice(&encoded).expect("deserialize progress report");
+
+        // Assert
+        assert_eq!(decoded, report);
     }
 }

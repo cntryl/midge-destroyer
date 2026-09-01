@@ -1,4 +1,4 @@
-use crate::config::{RunScale, ScenarioConfig, SuiteConfig, SuitePreset};
+use crate::config::{LeaseProfile, RunScale, ScenarioConfig, SuiteConfig, SuitePreset};
 use crate::types::BackendKind;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -50,6 +50,22 @@ pub enum ScaleArg {
     XLarge,
 }
 
+#[derive(Debug, Clone, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum LeaseProfileArg {
+    Conservative,
+    BoundedFailover,
+}
+
+impl From<LeaseProfileArg> for LeaseProfile {
+    fn from(value: LeaseProfileArg) -> Self {
+        match value {
+            LeaseProfileArg::Conservative => Self::Conservative,
+            LeaseProfileArg::BoundedFailover => Self::BoundedFailover,
+        }
+    }
+}
+
 impl From<ScaleArg> for RunScale {
     fn from(value: ScaleArg) -> Self {
         match value {
@@ -87,7 +103,7 @@ pub enum Command {
     /// Aggregate all existing run reports.
     Report(ReportArgs),
 
-    /// Escalate workload scales and stop at the first wobble/break frontier.
+    /// Escalate workload scales and record the first wobble, bend, and break.
     Frontier(FrontierArgs),
 }
 
@@ -100,6 +116,12 @@ pub struct FrontierArgs {
     pub seeds: usize,
     #[arg(long, default_value_t = 1)]
     pub seed_start: u64,
+    #[arg(long, default_value_t = 60)]
+    pub recovery_timeout_secs: u64,
+    #[arg(long, value_enum, default_value_t = ScaleArg::XLarge)]
+    pub max_scale: ScaleArg,
+    #[arg(long, value_enum, default_value_t = LeaseProfileArg::Conservative)]
+    pub lease_profile: LeaseProfileArg,
 }
 
 #[derive(Debug, Args)]
@@ -117,6 +139,12 @@ pub struct RunArgs {
 
     #[arg(long)]
     pub continue_on_failure: bool,
+
+    #[arg(long, default_value_t = 60)]
+    pub recovery_timeout_secs: u64,
+
+    #[arg(long, value_enum, default_value_t = LeaseProfileArg::Conservative)]
+    pub lease_profile: LeaseProfileArg,
 }
 
 #[derive(Debug, Args)]
@@ -132,6 +160,15 @@ pub struct SuiteArgs {
 
     #[arg(long)]
     pub max_scenarios: Option<usize>,
+
+    #[arg(long)]
+    pub seed: Option<u64>,
+
+    #[arg(long, default_value_t = 60)]
+    pub recovery_timeout_secs: u64,
+
+    #[arg(long, value_enum, default_value_t = LeaseProfileArg::Conservative)]
+    pub lease_profile: LeaseProfileArg,
 }
 
 #[derive(Debug, Args)]
@@ -150,6 +187,7 @@ pub struct ParsedRunConfig {
 }
 
 impl RunArgs {
+    #[must_use]
     pub fn to_config(&self) -> ParsedRunConfig {
         let scale = RunScale::from(self.scale.clone());
         let seed = ScenarioConfig::derived_seed(self.seed);
@@ -161,18 +199,24 @@ impl RunArgs {
                 cloud: self.cloud.clone().into(),
                 scale,
                 max_runtime_ms: scale.max_runtime_ms(),
+                recovery_timeout_ms: self.recovery_timeout_secs.saturating_mul(1_000),
                 fault_window_ms: 250,
                 cloud_only_manual: matches!(self.cloud, CloudArg::Sqrzl),
                 continue_on_failure: self.continue_on_failure,
+                lease_profile: self.lease_profile.clone().into(),
+                provider_endpoint: None,
             },
         }
     }
 }
 
 impl SuiteArgs {
+    #[must_use]
     pub fn build_config(&self) -> SuiteConfig {
-        let cloud = matches!(self.cloud, CloudArg::Sqrzl);
+        let cloud = self.cloud.clone().into();
         let preset = self.preset.clone();
-        SuiteConfig::from_preset(&preset.into(), cloud)
+        let mut config = SuiteConfig::from_preset(preset.into(), cloud);
+        config.lease_profile = self.lease_profile.clone().into();
+        config
     }
 }

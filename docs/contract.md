@@ -17,3 +17,15 @@
 - Recovery paths that are restartable must preserve previously acknowledged state.
 - Ledger replay is append-only and authoritative for expected run behavior.
 - Artifact capture is mandatory per scenario for deterministic replay.
+
+## Verdict semantics
+
+- `pass`: safety holds and every recovery completes before the warning threshold.
+- `wobble`: safety holds and recovery completes between the warning and soft deadline.
+- `bend`: safety holds and recovery completes after the soft but before the hard deadline.
+- `break`: a safety invariant fails or healthy infrastructure does not recover by the hard deadline.
+- `infrastructure_error`: Sqrzl health evidence attributes the interruption to the harness environment.
+- `skipped`: the backend or required feature does not make the scenario executable.
+
+Worker lifecycle and engine-open errors are written to a dedicated channel and
+never enter the mutation ledger.

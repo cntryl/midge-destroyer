@@ -13,9 +13,25 @@ Midge-specific adversarial correctness and recovery harness.
 
 ## CLI
 
-- `destroyer run <scenario> --cloud <local|sqrzl|s3|azure|gcs> --seed <u64> --scale <small|medium|large|x-large>`
-- `destroyer suite <smoke|standard|soak> --report-json`
+- `destroyer run <scenario> --cloud <local|sqrzl|s3|azure|gcs> --seed <u64> --scale <small|medium|large|xlarge>`
+- `destroyer suite <smoke|standard|soak> --cloud <backend> --seed <u64> --report-json`
 - `destroyer report --report-json`
+- `destroyer frontier <scenario|all> --max-scale <small|medium|large|xlarge>`
+
+Executable black-box scenarios include `recovery-crash-loop`,
+`lease-takeover-latency`, `uuid-compaction-pressure`,
+`scan-compaction-starvation`, `snapshot-pinned-gc-pressure`,
+`multi-cf-hot-cold-interference`, `delete-space-amplification`,
+`cold-cache-read-storm`, `ack-kill-window`, `cloud-cache-loss`,
+`manifest-race`, `sst-corruption`, `wal-truncation-race`,
+`stale-cache-recovery`, and `sqrzl-visibility`.
+`cloud-cache-loss`, `cold-cache-read-storm`, and `stale-cache-recovery`
+require `s3`, `azure`, `gcs`, or another cloud backend.
+
+Exact engine-cut scenarios require `--features failpoint-tier`:
+`wal-sync-ack-cut`, `manifest-sync-failure`, `compaction-commit-cut`,
+`wal-prune-cut`, `lease-renewal-failure`, and `flush-barrier`. These refuse to
+run when the feature is absent.
 
 ## Semantics (Midge-specific)
 
@@ -49,9 +65,18 @@ cargo run --bin midge-destroyer -- run smoke-local --cloud azure --scale small -
 cargo run --bin midge-destroyer -- run smoke-local --cloud gcs --scale small --seed 1
 ```
 
-The Compose defaults can be overridden with the corresponding
-`MIDGE_DESTROYER_S3_*`, `MIDGE_DESTROYER_AZURE_*`, and
-`MIDGE_DESTROYER_GCS_*` environment variables.
+Each command gets a unique Compose project and loopback-only dynamic API and
+health ports. The resolved API endpoint is passed explicitly to every worker.
+The execution directory retains the bind-mounted Sqrzl blobs, source and
+resolved Compose configuration, endpoints, health probes, service state, logs,
+and teardown result. Suites probe health before and after every scenario and
+restart an unhealthy emulator before continuing.
+
+Standard and soak suites run their full applicable catalog in stable order.
+Failpoint scenarios appear as `skipped` unless the binary was built with
+`--features failpoint-tier`; only an explicit `--max-scenarios` truncates a
+suite. Aggregation reads the new execution-scoped `suite-manifest.json` files,
+so stale standalone reports cannot be mixed into a result.
 
 ## Plan expectations
 
