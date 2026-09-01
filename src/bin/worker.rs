@@ -339,7 +339,6 @@ fn run_engine(
             return Ok(WorkerCompletion::Interrupted);
         }
 
-        let operation_started = std::time::Instant::now();
         write_progress(args, "mutation-start", index)?;
         let (next_index, outcomes) = if mixed_chunk {
             execute_workload_chunk(
@@ -360,7 +359,7 @@ fn run_engine(
         };
         write_progress(args, "mutation-complete", next_index)?;
         if first_mutation_ms.is_none() {
-            first_mutation_ms = Some(operation_started.elapsed().as_millis());
+            first_mutation_ms = Some(total_started.elapsed().as_millis());
         }
         if args
             .crash_after_step
@@ -556,56 +555,61 @@ fn verify_final_state(
     commands: &[WorkerCommand],
     report_file: &mut std::fs::File,
 ) -> Result<(), String> {
-    let mut expected = std::collections::BTreeMap::new();
-    let mut identities = std::collections::BTreeMap::new();
+    let mut expected = BTreeMap::<String, BTreeMap<String, (Option<String>, u64, usize)>>::new();
     for command in commands {
         let value = match command.action {
             MutationAction::Put => command.value.clone(),
             MutationAction::Delete => None,
             MutationAction::Noop => continue,
         };
-        let identity = (command.column_family.clone(), command.key.clone());
-        expected.insert(identity.clone(), value);
-        identities.insert(identity, (command.operation_id, command.sequence));
+        expected
+            .entry(command.column_family.clone())
+            .or_default()
+            .insert(
+                command.key.clone(),
+                (value, command.operation_id, command.sequence),
+            );
     }
-    for ((column_family, key), expected_value) in expected {
+    for (column_family, expected_values) in expected {
         let cf = column_families
             .get(&column_family)
             .ok_or_else(|| format!("verification column family {column_family} is unavailable"))?;
         let tx = engine
             .begin_tx(cf.id(), TransactionMode::ReadOnly)
             .map_err(|error| error.to_string())?;
-        let actual = tx
-            .get(key.as_bytes())
-            .map_err(|error| error.to_string())?
-            .map(|value| String::from_utf8_lossy(&value).into_owned());
-        if actual != expected_value {
-            let (operation_id, sequence) = identities[&(column_family.clone(), key.clone())];
-            emit_error(
-                report_file,
-                ReportPhase::Verification,
-                ObservedOutcome::Failed {
-                    operation_id,
-                    sequence,
-                    key: key.clone(),
-                    error: format!("recovery verification mismatch: expected {expected_value:?}, got {actual:?}"),
-                },
-            )
-            .map_err(|error| error.to_string())?;
-            return Err(format!("recovery verification failed for key {key}"));
-        }
-        if expected_value.is_some() {
-            let (operation_id, sequence) = identities[&(column_family.clone(), key.clone())];
-            emit_error(
-                report_file,
-                ReportPhase::Verification,
-                ObservedOutcome::Acked {
-                    operation_id,
-                    sequence,
-                    key: key.clone(),
-                },
-            )
-            .map_err(|error| error.to_string())?;
+        for (key, (expected_value, operation_id, sequence)) in expected_values {
+            let actual = tx
+                .get(key.as_bytes())
+                .map_err(|error| error.to_string())?
+                .map(|value| String::from_utf8_lossy(&value).into_owned());
+            if actual != expected_value {
+                emit_error(
+                    report_file,
+                    ReportPhase::Verification,
+                    ObservedOutcome::Failed {
+                        operation_id,
+                        sequence,
+                        key: key.clone(),
+                        error: format!(
+                            "recovery verification mismatch: expected {expected_value:?}, got {actual:?}"
+                        ),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+                return Err(format!("recovery verification failed for key {key}"));
+            }
+            if expected_value.is_some() {
+                emit_error(
+                    report_file,
+                    ReportPhase::Verification,
+                    ObservedOutcome::Acked {
+                        operation_id,
+                        sequence,
+                        key: key.clone(),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            }
         }
     }
     Ok(())

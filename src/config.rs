@@ -256,8 +256,7 @@ mod tests {
         let mandatory_wait_floor_ms = skew_ms + cloud_ttl_ms;
 
         // Act
-        let budget =
-            LeaseProfile::BoundedFailover.recovery_budget_with_ttl(120_000, cloud_ttl_ms);
+        let budget = LeaseProfile::BoundedFailover.recovery_budget_with_ttl(120_000, cloud_ttl_ms);
 
         // Assert: a fenced takeover cannot finish before the floor, so a correctly
         // calibrated budget must grade that as achievable, not as a guaranteed
