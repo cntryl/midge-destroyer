@@ -3,10 +3,11 @@
 `midge-destroyer` keeps Midge's conservative lease behavior as the default and
 lets crash/recovery campaigns opt into a bounded-failover profile.
 
-| Profile | TTL | Clock-skew tolerance | Warning | Soft deadline |
-| --- | ---: | ---: | ---: | ---: |
-| `conservative` | 30s | 15s | 40s | 50s |
-| `bounded-failover` | 30s | 5s | 32s | 40s |
+| Profile | Backend | TTL | Clock-skew tolerance | Warning | Soft deadline |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `conservative` | all | 30s | 15s | 48s | 53s |
+| `bounded-failover` | local | 10s | 5s | 18s | 23s |
+| `bounded-failover` | non-local | 30s | 5s | 38s | 43s |
 
 The bounded profile is an availability experiment, not a fencing bypass. Epoch
 checks, conditional lease writes, and fail-closed renewal behavior remain
