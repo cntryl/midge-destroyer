@@ -688,6 +688,13 @@ fn execute_workload_chunk(
             cloud,
             crash_during_chunk,
         ),
+        WorkloadKind::TransactionHistory => Ok(execute_transaction_history_chunk(
+            engine,
+            column_family_for(column_families, &commands[start])?,
+            commands,
+            start,
+            cloud,
+        )),
         WorkloadKind::Pointwise => Err("pointwise command entered workload chunk".to_string()),
         _ => execute_mixed_chunk(
             engine,
@@ -1050,18 +1057,45 @@ fn execute_batch_commands(
         Ok(tx) => tx,
         Err(error) => return failed_outcomes(commands, &error.to_string()),
     };
+    let mut transaction_view = BTreeMap::<String, Option<Vec<u8>>>::new();
     for command in commands {
         let result = match command.action {
-            MutationAction::Put => tx.put(
-                command.key.clone().into_bytes(),
-                command.value.clone().unwrap_or_default().into_bytes(),
-                None,
-            ),
-            MutationAction::Delete => tx.delete(command.key.clone().into_bytes()),
+            MutationAction::Put => {
+                let value = command.value.clone().unwrap_or_default().into_bytes();
+                let result = tx.put(command.key.clone().into_bytes(), value.clone(), None);
+                if result.is_ok() {
+                    transaction_view.insert(command.key.clone(), Some(value));
+                }
+                result
+            }
+            MutationAction::Delete => {
+                let result = tx.delete(command.key.clone().into_bytes());
+                if result.is_ok() {
+                    transaction_view.insert(command.key.clone(), None);
+                }
+                result
+            }
             MutationAction::Noop => Ok(()),
         };
         if let Err(error) = result {
             return failed_outcomes(commands, &error.to_string());
+        }
+        if let Some(expected) = transaction_view.get(&command.key) {
+            match tx.get(command.key.as_bytes()) {
+                Ok(actual) if actual.as_deref() == expected.as_deref() => {}
+                Ok(actual) => {
+                    return failed_outcomes(
+                        commands,
+                        &format!(
+                            "transaction read-your-writes mismatch for {}: expected {:?}, got {:?}",
+                            command.key,
+                            expected.as_deref(),
+                            actual.as_deref()
+                        ),
+                    );
+                }
+                Err(error) => return failed_outcomes(commands, &error.to_string()),
+            }
         }
     }
     let durable = commands.iter().any(|command| command.durable);
@@ -1069,6 +1103,19 @@ fn execute_batch_commands(
         Ok(()) => commands.iter().map(|command| acked(command)).collect(),
         Err(error) => failed_outcomes(commands, &error.to_string()),
     }
+}
+
+fn execute_transaction_history_chunk(
+    engine: &cntryl_midge::Engine,
+    cf: &ColumnFamilyHandle,
+    commands: &[WorkerCommand],
+    start: usize,
+    cloud: bool,
+) -> (usize, Vec<ObservedOutcome>) {
+    let end = workload_chunk_end(commands, start);
+    let chunk = commands[start..end].iter().collect::<Vec<_>>();
+    let outcomes = execute_batch_commands(engine, cf, &chunk, cloud);
+    (end, outcomes)
 }
 
 fn exercise_read_pressure(
