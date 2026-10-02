@@ -164,6 +164,13 @@ const SCENARIO_CATALOG: &[ScenarioDefinition] = &[
         smoke: false,
     },
     ScenarioDefinition {
+        name: "transaction-history",
+        applicability: BackendApplicability::Any,
+        required_feature: None,
+        expected_behavior: FaultExpectation::SafetyPreserved,
+        smoke: false,
+    },
+    ScenarioDefinition {
         name: "scan-compaction-starvation",
         applicability: BackendApplicability::Any,
         required_feature: None,
@@ -348,6 +355,7 @@ pub enum WorkloadKind {
     MultiCfHotCold,
     DeleteSpaceAmplification,
     ColdCacheReadStorm,
+    TransactionHistory,
 }
 
 impl WorkloadKind {
@@ -358,6 +366,7 @@ impl WorkloadKind {
             "multi-cf-hot-cold-interference" => Some(Self::MultiCfHotCold),
             "delete-space-amplification" => Some(Self::DeleteSpaceAmplification),
             "cold-cache-read-storm" => Some(Self::ColdCacheReadStorm),
+            "transaction-history" => Some(Self::TransactionHistory),
             _ => None,
         }
     }
@@ -410,6 +419,15 @@ pub struct DeterministicPlan {
 impl Scenario {
     #[must_use]
     pub fn new(name: &str, seed: u64, scale: RunScale) -> Self {
+        if name == "transaction-history" {
+            return Self {
+                name: name.to_string(),
+                seed,
+                scale,
+                operations: transaction_history_operations(seed, scale),
+                faults: Vec::new(),
+            };
+        }
         if name == "uuid-compaction-pressure" {
             return Self {
                 name: name.to_string(),
@@ -486,6 +504,46 @@ impl Scenario {
     }
 }
 
+fn transaction_history_operations(seed: u64, scale: RunScale) -> Vec<MutationOp> {
+    const TRANSACTION_WIDTH: usize = 8;
+    let seed_offset = usize::try_from(seed % 15).unwrap_or_default();
+    (0..scale.ops())
+        .map(|sequence| {
+            let workload_batch = sequence / TRANSACTION_WIDTH;
+            let slot = (sequence + seed_offset) % 3;
+            let action = if (sequence + seed_offset) % 5 == 4 {
+                MutationAction::Delete
+            } else {
+                MutationAction::Put
+            };
+            MutationOp {
+                id: seed.wrapping_mul(10_007).wrapping_add(sequence as u64),
+                sequence,
+                action: action.clone(),
+                key: format!("txn-{seed:016x}-{slot}"),
+                value: (action == MutationAction::Put)
+                    .then(|| format!("txn-value-{seed:016x}-{sequence:04}")),
+                durable: !workload_batch.is_multiple_of(2),
+                workload_lane: WorkloadLane::Batch,
+                workload_batch,
+                workload_kind: WorkloadKind::TransactionHistory,
+                column_family: default_column_family(),
+            }
+        })
+        .collect()
+}
+
+fn transaction_history_fault_boundaries(operations: &[MutationOp]) -> Vec<usize> {
+    operations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, operation)| {
+            (index > 0 && operation.workload_batch != operations[index - 1].workload_batch)
+                .then_some(index)
+        })
+        .collect()
+}
+
 impl DeterministicPlan {
     #[must_use]
     pub fn from_seed(name: &str, seed: u64, scale: RunScale) -> Self {
@@ -495,6 +553,7 @@ impl DeterministicPlan {
         let fault_count = scenario_fault_count(name, scale);
         let mut candidates: Vec<usize> = match name {
             "ack-kill-window" => final_durable_puts(&scenario.operations),
+            "transaction-history" => transaction_history_fault_boundaries(&scenario.operations),
             "uuid-compaction-pressure"
             | "scan-compaction-starvation"
             | "snapshot-pinned-gc-pressure"
@@ -746,6 +805,7 @@ fn scenario_fault_count(name: &str, scale: RunScale) -> usize {
             | "cold-cache-read-storm"
             | "ack-kill-window"
             | "cloud-cache-loss"
+            | "transaction-history"
     ) || scenario_definition(name)
         .is_some_and(|definition| definition.required_feature.is_some())
     {
@@ -782,6 +842,7 @@ fn fault_catalog(name: &str) -> &'static [FaultClass] {
         "wal-prune-cut" => &[FaultClass::CompactionRace],
         "lease-renewal-failure" => &[FaultClass::LeaseRenewalCut],
         "smoke-local" => &[],
+        "transaction-history" => &[FaultClass::ForcedReopen],
         "dupe-dispatch" => &[FaultClass::ProcessKill, FaultClass::DroppedWrite],
         "flush-barrier" => &[
             FaultClass::FlushCompactionBarrierFault,
@@ -809,6 +870,43 @@ mod tests {
         let first = DeterministicPlan::from_seed("repro", 0xFEED_BABE, RunScale::Small);
         let second = DeterministicPlan::from_seed("repro", 0xFEED_BABE, RunScale::Small);
         assert_eq!(first.scenario, second.scenario);
+    }
+
+    #[test]
+    fn should_generate_reproducible_transaction_histories_with_overlapping_keys() {
+        // Arrange
+        let first = DeterministicPlan::from_seed("transaction-history", 41, RunScale::Small);
+        let replay = DeterministicPlan::from_seed("transaction-history", 41, RunScale::Small);
+
+        // Act
+        let mut groups = std::collections::BTreeMap::<usize, Vec<&MutationOp>>::new();
+        for operation in &first.scenario.operations {
+            groups
+                .entry(operation.workload_batch)
+                .or_default()
+                .push(operation);
+        }
+
+        // Assert
+        assert_eq!(first.scenario.operations, replay.scenario.operations);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(first.scenario.faults.len(), 1);
+        assert_eq!(first.scenario.faults[0].class, FaultClass::ForcedReopen);
+        assert_eq!(first.scenario.faults[0].step % 8, 0);
+        assert!(groups.values().all(|group| group.len() == 8));
+        assert!(groups.values().all(|group| {
+            let keys = group
+                .iter()
+                .map(|operation| operation.key.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            keys.len() < group.len()
+                && group
+                    .iter()
+                    .any(|operation| operation.action == MutationAction::Delete)
+                && group
+                    .iter()
+                    .any(|operation| operation.action == MutationAction::Put)
+        }));
     }
 
     #[test]
@@ -1003,9 +1101,11 @@ mod tests {
         // Assert
         assert!(local_names.contains(&"lease-takeover-latency"));
         assert!(local_names.contains(&"uuid-compaction-pressure"));
+        assert!(local_names.contains(&"transaction-history"));
         assert!(!local_names.contains(&"cloud-cache-loss"));
         assert!(s3_names.contains(&"lease-takeover-latency"));
         assert!(s3_names.contains(&"uuid-compaction-pressure"));
+        assert!(s3_names.contains(&"transaction-history"));
         assert!(s3_names.contains(&"cloud-cache-loss"));
         assert!(s3_names.contains(&"sqrzl-visibility"));
         for name in [

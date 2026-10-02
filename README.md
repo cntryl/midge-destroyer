@@ -19,12 +19,17 @@ Midge-specific adversarial correctness and recovery harness.
 - `destroyer frontier <scenario|all> --max-scale <small|medium|large|xlarge>`
 
 Executable black-box scenarios include `recovery-crash-loop`,
-`lease-takeover-latency`, `uuid-compaction-pressure`,
+`lease-takeover-latency`, `uuid-compaction-pressure`, `transaction-history`,
 `scan-compaction-starvation`, `snapshot-pinned-gc-pressure`,
 `multi-cf-hot-cold-interference`, `delete-space-amplification`,
 `cold-cache-read-storm`, `ack-kill-window`, `cloud-cache-loss`,
 `manifest-race`, `sst-corruption`, `wal-truncation-race`,
 `stale-cache-recovery`, and `sqrzl-visibility`.
+`transaction-history` applies seeded groups of overlapping writes and deletes
+in atomic transactions, checks each staged value through the transaction's
+read-your-writes view against an independent ordered model, closes and reopens
+the engine at transaction boundaries, then verifies the recovered committed
+state.
 `cloud-cache-loss`, `cold-cache-read-storm`, `wal-truncation-race`, and `stale-cache-recovery`
 require `s3`, `azure`, `gcs`, or another cloud backend.
 The current `wal-truncation-race` injector removes cloud WAL cache files;
