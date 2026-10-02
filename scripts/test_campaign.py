@@ -24,6 +24,15 @@ def report(verdict):
 
 
 class CampaignTests(unittest.TestCase):
+    def test_should_run_published_local_campaign_when_qualifying_pull_request(self):
+        # Arrange / Act
+        with patch.object(plan_campaigns, "resolve_target", return_value={"kind": "registry", "version": "0.3.1"}):
+            matrix = plan_campaigns.plan("pull_request", "", "latest", "local", "standard", 1, 1, False, 100, 1)
+        # Assert
+        self.assertEqual(matrix["include"][0]["resolved"], "0.3.1")
+        self.assertEqual(matrix["include"][0]["preset"], "standard")
+        self.assertFalse(matrix["include"][0]["instrumented"])
+
     def test_should_resolve_hourly_target_once_and_rotate_seeds_between_runs(self):
         # Arrange
         target = {"kind": "registry", "version": "0.3.1"}

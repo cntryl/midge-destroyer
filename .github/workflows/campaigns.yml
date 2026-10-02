@@ -1,6 +1,7 @@
 name: Continuous Midge campaigns
 
 on:
+  pull_request:
   schedule:
     - cron: "17 * * * *"
     - cron: "43 2 * * *"

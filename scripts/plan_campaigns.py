@@ -8,7 +8,9 @@ from campaign import resolve_target
 
 def plan(event, schedule, requested, backend, preset, seeds, seed_start, instrumented, run_id, attempt):
     selections = []
-    if event == "workflow_dispatch":
+    if event == "pull_request":
+        selections.append(("latest", "local", "standard", 1, 100, False, "pr-local"))
+    elif event == "workflow_dispatch":
         if backend not in {"local", "sqrzl", "s3", "azure", "gcs"} or preset not in {"smoke", "standard", "soak"}:
             raise ValueError("invalid backend or preset")
         if not 1 <= seeds <= 4 or seed_start < 0 or seed_start + seeds > 2**64:
