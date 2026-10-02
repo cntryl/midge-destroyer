@@ -2,6 +2,7 @@ services:
   sqrzl:
     image: ghcr.io/sqrzl/sqrzl-emulator@sha256:876e017f850e53f3f4172cae459982cfe9435584fcb8e4640120b2e5fabfc624
     hostname: sqrzl
+    user: ${SQRZL_CONTAINER_USER:?set SQRZL_CONTAINER_USER}
     environment:
       SQRZL_BLOBS_PATH: /app/blobs
       SQRZL_ACCESS_KEY_ID: admin
