@@ -1,6 +1,6 @@
 services:
   sqrzl:
-    image: ghcr.io/sqrzl/sqrzl-emulator:latest
+    image: ghcr.io/sqrzl/sqrzl-emulator@sha256:876e017f850e53f3f4172cae459982cfe9435584fcb8e4640120b2e5fabfc624
     hostname: sqrzl
     environment:
       SQRZL_BLOBS_PATH: /app/blobs

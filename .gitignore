@@ -27,4 +27,5 @@ Thumbs.db
 **/*.rs.bk
 flamegraph.svg
 perf.data*
-
+__pycache__/
+campaign-plan.json

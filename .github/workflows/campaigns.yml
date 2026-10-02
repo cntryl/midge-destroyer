@@ -1,0 +1,147 @@
+name: Continuous Midge campaigns
+
+on:
+  pull_request:
+  schedule:
+    - cron: "17 * * * *"
+    - cron: "43 2 * * *"
+    - cron: "13 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Midge target: latest, released version, main, develop, or git:<commit SHA>"
+        default: latest
+        type: string
+      backend:
+        description: Storage backend (cloud protocols use isolated Sqrzl)
+        default: local
+        type: choice
+        options: [local, sqrzl, s3, azure, gcs]
+      preset:
+        description: Workload preset
+        default: standard
+        type: choice
+        options: [smoke, standard, soak]
+      seeds:
+        description: Number of independent seeds (1-4)
+        default: "2"
+        type: string
+      seed_start:
+        description: First seed for replay
+        default: "1"
+        type: string
+      instrumented:
+        description: Enable optional engine failpoint tier
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Resolve immutable campaign targets
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+          REQUESTED_TARGET: ${{ inputs.target || 'latest' }}
+          BACKEND: ${{ inputs.backend || 'local' }}
+          PRESET: ${{ inputs.preset || 'standard' }}
+          SEEDS: ${{ inputs.seeds || '2' }}
+          SEED_START: ${{ inputs.seed_start || '1' }}
+          INSTRUMENTED: ${{ inputs.instrumented && 'true' || 'false' }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: python3 scripts/plan_campaigns.py
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: campaign-plan
+          path: campaign-plan.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  campaign:
+    needs: plan
+    name: "${{ matrix.requested }} / ${{ matrix.backend }} / ${{ matrix.lane }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    concurrency:
+      group: "destroyer-${{ matrix.lane }}-${{ matrix.backend }}-${{ matrix.instrumented }}"
+      cancel-in-progress: false
+    env:
+      CARGO_INCREMENTAL: 0
+      MIDGE_DESTROYER_CLOUD_SMOKE: "1"
+      TARGET: ${{ matrix.resolved }}
+      REQUESTED: ${{ matrix.requested }}
+      BACKEND: ${{ matrix.backend }}
+      PRESET: ${{ matrix.preset }}
+      SEEDS: ${{ matrix.seeds }}
+      SEED_START: ${{ matrix.seed_start }}
+      INSTRUMENTED: ${{ matrix.instrumented }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup update stable
+      - name: Define campaign output directory
+        run: echo "OUTPUT=$RUNNER_TEMP/destroyer-campaign" >> "$GITHUB_ENV"
+      - name: Prepare and verify selected engine source
+        shell: bash
+        run: |
+          set -euo pipefail
+          flags=()
+          if [ "$INSTRUMENTED" = "true" ]; then flags+=(--instrumented); fi
+          python3 scripts/campaign.py prepare --target "$TARGET" --requested-target "$REQUESTED" --output "$OUTPUT" --no-build "${flags[@]}"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ runner.temp }}/destroyer-campaign/build -> target
+          shared-key: destroyer-campaign
+          cache-on-failure: true
+      - name: Build controller and worker from locked target
+        shell: bash
+        run: |
+          set -euo pipefail
+          flags=()
+          if [ "$INSTRUMENTED" = "true" ]; then flags+=(--features failpoint-tier); fi
+          cargo build --manifest-path "$OUTPUT/build/Cargo.toml" --release --locked --bins "${flags[@]}"
+      - name: Execute every applicable scenario and inspect verdicts
+        run: python3 scripts/campaign.py run --output "$OUTPUT" --backend "$BACKEND" --preset "$PRESET" --seeds "$SEEDS" --seed-start "$SEED_START" --timeout-seconds 3600
+      - name: Capture logs and stop only campaign-owned emulator projects
+        if: always()
+        run: python3 scripts/campaign.py cleanup --output "$OUTPUT"
+      - name: Retain campaign evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: "campaign-${{ matrix.lane }}-${{ matrix.backend }}"
+          path: |
+            ${{ runner.temp }}/destroyer-campaign/*.json
+            ${{ runner.temp }}/destroyer-campaign/*.log
+            ${{ runner.temp }}/destroyer-campaign/*.md
+            ${{ runner.temp }}/destroyer-campaign/Cargo.lock
+            ${{ runner.temp }}/destroyer-campaign/seed-*/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Summarize triage candidates
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$OUTPUT/triage.md" ]; then
+            cat "$OUTPUT/triage.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Campaign did not complete. Inspect job logs and target/provenance artifacts; no success or Midge defect is claimed." >> "$GITHUB_STEP_SUMMARY"
+          fi

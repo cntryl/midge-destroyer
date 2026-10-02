@@ -228,7 +228,8 @@ const SCENARIO_CATALOG: &[ScenarioDefinition] = &[
     },
     ScenarioDefinition {
         name: "wal-truncation-race",
-        applicability: BackendApplicability::Any,
+        // This injector deletes a WAL cache file. Local WAL files are authoritative.
+        applicability: BackendApplicability::CloudOnly,
         required_feature: None,
         expected_behavior: FaultExpectation::SafetyPreserved,
         smoke: false,
@@ -1021,6 +1022,21 @@ mod tests {
     }
 
     #[test]
+    fn should_only_delete_disposable_wal_cache_when_backend_is_cloud() {
+        // Arrange
+        let definition = scenario_definition("wal-truncation-race").expect("known scenario");
+
+        // Act
+        let local = suite_scenarios(SuitePreset::Standard, BackendKind::Local, false);
+        let cloud = suite_scenarios(SuitePreset::Standard, BackendKind::S3, false);
+
+        // Assert
+        assert_eq!(definition.applicability, BackendApplicability::CloudOnly);
+        assert!(!local.iter().any(|s| s.definition.name == definition.name));
+        assert!(cloud.iter().any(|s| s.definition.name == definition.name));
+    }
+
+    #[test]
     fn should_encode_distinct_production_workload_intent_for_new_scenarios() {
         // Arrange
         let cases = [
@@ -1043,7 +1059,7 @@ mod tests {
         // Act and Assert
         for (name, kind) in cases {
             let scenario = Scenario::new(name, 17, RunScale::Small);
-            assert!(!scenario.operations.is_empty());
+            assert_ne!(scenario.operations.len(), 0);
             assert!(scenario
                 .operations
                 .iter()
@@ -1104,7 +1120,7 @@ mod tests {
     #[test]
     fn should_only_generate_wal_truncation_faults_for_wal_truncation_race() {
         let plan = DeterministicPlan::from_seed("wal-truncation-race", 3, RunScale::Small);
-        assert!(!plan.scenario.faults.is_empty());
+        assert_ne!(plan.scenario.faults.len(), 0);
         assert!(plan
             .scenario
             .faults
@@ -1115,7 +1131,7 @@ mod tests {
     #[test]
     fn should_only_generate_stale_cache_faults_for_stale_cache_recovery() {
         let plan = DeterministicPlan::from_seed("stale-cache-recovery", 3, RunScale::Small);
-        assert!(!plan.scenario.faults.is_empty());
+        assert_ne!(plan.scenario.faults.len(), 0);
         assert!(plan
             .scenario
             .faults
