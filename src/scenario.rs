@@ -228,7 +228,8 @@ const SCENARIO_CATALOG: &[ScenarioDefinition] = &[
     },
     ScenarioDefinition {
         name: "wal-truncation-race",
-        applicability: BackendApplicability::Any,
+        // This injector deletes a WAL cache file. Local WAL files are authoritative.
+        applicability: BackendApplicability::CloudOnly,
         required_feature: None,
         expected_behavior: FaultExpectation::SafetyPreserved,
         smoke: false,
@@ -1018,6 +1019,21 @@ mod tests {
         }
         assert!(!local_names.contains(&"cold-cache-read-storm"));
         assert!(s3_names.contains(&"cold-cache-read-storm"));
+    }
+
+    #[test]
+    fn should_only_delete_disposable_wal_cache_when_backend_is_cloud() {
+        // Arrange
+        let definition = scenario_definition("wal-truncation-race").expect("known scenario");
+
+        // Act
+        let local = suite_scenarios(SuitePreset::Standard, BackendKind::Local, false);
+        let cloud = suite_scenarios(SuitePreset::Standard, BackendKind::S3, false);
+
+        // Assert
+        assert_eq!(definition.applicability, BackendApplicability::CloudOnly);
+        assert!(!local.iter().any(|s| s.definition.name == definition.name));
+        assert!(cloud.iter().any(|s| s.definition.name == definition.name));
     }
 
     #[test]
