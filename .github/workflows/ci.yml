@@ -1,0 +1,34 @@
+name: Destroyer CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: destroyer-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Rust with lint components
+        run: rustup update stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test campaign target and verdict boundaries
+        run: python3 scripts/test_campaign.py
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Pedantic lint
+        run: cargo clippy --all-targets --all-features -- -D warnings -D clippy::pedantic
+      - name: Test harness and real local recovery smoke
+        run: cargo test --locked

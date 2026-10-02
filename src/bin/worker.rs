@@ -828,6 +828,7 @@ fn execute_snapshot_pinned_chunk(
         .begin_tx(cf.id(), TransactionMode::ReadOnly)
         .map_err(|error| error.to_string())?;
     let pinned = engine
+        .metrics()
         .get_runtime_metrics()
         .map_err(|error| error.to_string())?
         .active_snapshots;
@@ -982,6 +983,7 @@ fn validate_workload_invariants(
     }
     let live_bytes = live.values().copied().sum::<u64>();
     let metrics = engine
+        .metrics()
         .get_runtime_metrics()
         .map_err(|error| error.to_string())?;
     let hard_bound = live_bytes.saturating_mul(8).saturating_add(1_048_576);
@@ -1006,9 +1008,11 @@ fn write_workload_evidence(
         return Ok(());
     }
     let runtime = engine
+        .metrics()
         .get_runtime_metrics()
         .map_err(|error| error.to_string())?;
     let read_amplification = engine
+        .metrics()
         .get_read_amp_metrics()
         .map_err(|error| error.to_string())?;
     let evidence = serde_json::json!({

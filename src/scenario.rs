@@ -1043,7 +1043,7 @@ mod tests {
         // Act and Assert
         for (name, kind) in cases {
             let scenario = Scenario::new(name, 17, RunScale::Small);
-            assert!(!scenario.operations.is_empty());
+            assert_ne!(scenario.operations.len(), 0);
             assert!(scenario
                 .operations
                 .iter()
@@ -1104,7 +1104,7 @@ mod tests {
     #[test]
     fn should_only_generate_wal_truncation_faults_for_wal_truncation_race() {
         let plan = DeterministicPlan::from_seed("wal-truncation-race", 3, RunScale::Small);
-        assert!(!plan.scenario.faults.is_empty());
+        assert_ne!(plan.scenario.faults.len(), 0);
         assert!(plan
             .scenario
             .faults
@@ -1115,7 +1115,7 @@ mod tests {
     #[test]
     fn should_only_generate_stale_cache_faults_for_stale_cache_recovery() {
         let plan = DeterministicPlan::from_seed("stale-cache-recovery", 3, RunScale::Small);
-        assert!(!plan.scenario.faults.is_empty());
+        assert_ne!(plan.scenario.faults.len(), 0);
         assert!(plan
             .scenario
             .faults
