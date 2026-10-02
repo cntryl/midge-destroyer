@@ -135,10 +135,22 @@ impl EmulatorController {
             "midge-destroyer-{backend:?}-{}-{execution_id}",
             std::process::id()
         ));
-        let environment = vec![(
-            "SQRZL_BLOBS_HOST_PATH".to_string(),
-            blobs_dir.to_string_lossy().into_owned(),
-        )];
+        #[cfg(unix)]
+        let container_user = {
+            use std::os::unix::fs::MetadataExt;
+            let owner = std::fs::metadata(&blobs_dir).context("read Sqrzl directory ownership")?;
+            format!("{}:{}", owner.uid(), owner.gid())
+        };
+        // Docker Desktop maps Windows bind mounts; retain the image's numeric identity.
+        #[cfg(not(unix))]
+        let container_user = "65532:65532".to_string();
+        let environment = vec![
+            (
+                "SQRZL_BLOBS_HOST_PATH".to_string(),
+                blobs_dir.to_string_lossy().into_owned(),
+            ),
+            ("SQRZL_CONTAINER_USER".to_string(), container_user),
+        ];
         Ok(Some(Self {
             backend,
             compose_file,
@@ -371,6 +383,28 @@ fn unix_millis() -> u128 {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[cfg(unix)]
+    #[test]
+    fn should_run_emulator_as_evidence_directory_owner_when_using_bind_mounts() {
+        use std::os::unix::fs::MetadataExt;
+        // Arrange
+        let evidence = tempfile::tempdir().expect("create evidence directory");
+        for backend in [BackendKind::S3, BackendKind::Azure, BackendKind::Gcs] {
+            // Act
+            let controller = EmulatorController::for_backend(backend, evidence.path(), "ownership")
+                .expect("prepare emulator")
+                .expect("cloud controller");
+            let owner = std::fs::metadata(evidence.path().join("emulator/blobs"))
+                .expect("read directory owner");
+
+            // Assert
+            assert!(controller.environment.contains(&(
+                "SQRZL_CONTAINER_USER".to_string(),
+                format!("{}:{}", owner.uid(), owner.gid()),
+            )));
+        }
+    }
 
     #[derive(Default)]
     struct RecordingExecutor {
