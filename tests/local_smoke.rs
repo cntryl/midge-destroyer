@@ -8,16 +8,9 @@ use midge_destroyer::scenario::{DeterministicPlan, FaultClass};
 #[test]
 fn should_run_local_smoke_once() {
     let artifacts_root = tempfile::tempdir().expect("create temp artifact dir");
-    let exe = std::env::current_exe().expect("locate integration test executable");
-    let binary_dir = exe
-        .parent()
-        .and_then(|parent| parent.parent())
-        .expect("locate target debug directory");
-    let suffix = if cfg!(windows) { ".exe" } else { "" };
-    let binary = binary_dir.join(format!("midge-destroyer{suffix}"));
 
     let scenario_name = "smoke-local";
-    let output = Command::new(&binary)
+    let output = Command::new(env!("CARGO_BIN_EXE_midge-destroyer"))
         .arg("--artifacts-root")
         .arg(artifacts_root.path())
         .arg("run")
@@ -57,13 +50,6 @@ fn should_run_local_smoke_once() {
 #[test]
 fn should_continue_after_expected_worker_crash_without_report_file() {
     let artifacts_root = tempfile::tempdir().expect("create temp artifact dir");
-    let exe = std::env::current_exe().expect("locate integration test executable");
-    let binary_dir = exe
-        .parent()
-        .and_then(|parent| parent.parent())
-        .expect("locate target debug directory");
-    let suffix = if cfg!(windows) { ".exe" } else { "" };
-    let binary = binary_dir.join(format!("midge-destroyer{suffix}"));
     let crash_seed = (0_u64..64)
         .find(|seed| {
             DeterministicPlan::from_seed("recovery-crash-loop", *seed, RunScale::Small)
@@ -74,7 +60,7 @@ fn should_continue_after_expected_worker_crash_without_report_file() {
         })
         .expect("find deterministic hard-crash seed");
 
-    let output = Command::new(&binary)
+    let output = Command::new(env!("CARGO_BIN_EXE_midge-destroyer"))
         .arg("--artifacts-root")
         .arg(artifacts_root.path())
         .arg("run")
