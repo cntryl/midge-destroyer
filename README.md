@@ -58,7 +58,7 @@ run when the feature is absent.
 `--cloud sqrzl` is included for parity testing and chaos injection.
 This mode is manual by default and only runs when `MIDGE_DESTROYER_CLOUD_SMOKE=1`.
 
-Cloud protocol campaigns use the pinned Sqrzl emulator digest in the Compose files. Selecting `s3`,
+Cloud protocol campaigns use `ghcr.io/sqrzl/sqrzl-emulator:latest` in the Compose files. Selecting `s3`,
 `azure`, or `gcs` chooses the Sqrzl protocol surface used by Midge. The
 controller starts the matching Compose project, runs the command, and brings
 it down even when the harness returns an error:
